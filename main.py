@@ -21,7 +21,7 @@ def keep_alive():
 
 # ----- Charger les variables d'environnement -----
 load_dotenv()
-DISCORD_TOKEN = os.getenv("DISCORD_TOKEN_TICKET")
+DISCORD_TOKEN = os.getenv("DISCORD_TOKEN")
 
 if not DISCORD_TOKEN:
     print("❌ DISCORD_TOKEN_TICKET manquant dans les variables d'environnement")
