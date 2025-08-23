@@ -249,6 +249,7 @@ async def create_ticket(user, guild):
 
     if STAFF_ROLE_ID:
         role = guild.get_role(STAFF_ROLE_ID)
+        print(f"[DEBUG] Rôle staff autorisé : {role} ({1408566471835123713})")
         if role:
             overwrites[role] = discord.PermissionOverwrite(read_messages=True, send_messages=True)
 
