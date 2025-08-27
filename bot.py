@@ -5,24 +5,8 @@ from discord.ext import commands, tasks
 import asyncio
 import json
 from threading import Thread
-from flask import Flask
 import time
 
-# ----- Keep Alive pour Replit -----
-app = Flask('')
-
-@app.route('/')
-def home():
-    return "Bot en ligne !"
-
-def run():
-    app.run(host='0.0.0.0', port=8080)
-
-def keep_alive():
-    t = Thread(target=run)
-    t.start()
-
-keep_alive()
 
 # ---------------------------------
 # ----- Bot Discord -----
@@ -249,7 +233,6 @@ async def create_ticket(user, guild):
 
     if STAFF_ROLE_ID:
         role = guild.get_role(STAFF_ROLE_ID)
-        print(f"[DEBUG] Rôle staff autorisé : {role} ({1408566471835123713})")
         if role:
             overwrites[role] = discord.PermissionOverwrite(read_messages=True, send_messages=True)
 
@@ -355,7 +338,7 @@ async def close_ticket(interaction: discord.Interaction):
         print(f"Erreur lors de la suppression du channel: {e}")
 
 # ----- /config avec bouton -----
-@tree.command(description="[STAFF] Configurer le message ticket")
+@tree.command(description="[ADMIN] Configurer le message ticket")
 @app_commands.describe(
     channel_id="ID du salon où poster le message",
     message_text="Texte du message avec bouton",
@@ -368,13 +351,11 @@ async def config(interaction: discord.Interaction, channel_id: str, message_text
             "Cette commande doit être utilisée sur le serveur.", ephemeral=True
         )
 
-    if STAFF_ROLE_ID:
-        role = guild.get_role(STAFF_ROLE_ID)
-        member = guild.get_member(interaction.user.id)
-        if role and member and role not in member.roles:
-            return await interaction.response.send_message(
-                "❌ Seul le staff peut configurer.", ephemeral=True
-            )
+    # ✅ Vérification permission ADMIN
+    if not interaction.user.guild_permissions.administrator:
+        return await interaction.response.send_message(
+            "❌ Seuls les administrateurs peuvent utiliser cette commande.", ephemeral=True
+        )
 
     try:
         channel = guild.get_channel(int(channel_id))
@@ -401,6 +382,7 @@ async def config(interaction: discord.Interaction, channel_id: str, message_text
         response_text = f"Message configuré dans {channel.mention} avec bouton 'Ouvrir un ticket'."
 
     await interaction.response.send_message(response_text, ephemeral=True)
+
 
 # ----- Update status -----
 @tasks.loop(minutes=5)
