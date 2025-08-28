@@ -71,11 +71,12 @@ async def init_database():
             )
         ''')
         
-        # Table pour le message de status
+        # Table pour le message de status - Correction: une entrée par serveur
         await conn.execute('''
-            CREATE TABLE IF NOT EXISTS status_message (
-                id INTEGER PRIMARY KEY DEFAULT 1,
+            CREATE TABLE IF NOT EXISTS status_messages (
+                guild_id BIGINT PRIMARY KEY,
                 message_id BIGINT,
+                channel_id BIGINT,
                 updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
             )
         ''')
@@ -264,21 +265,44 @@ async def remove_close_button_message(message_id: int):
             DELETE FROM close_button_messages WHERE message_id = $1
         ''', message_id)
 
-# ----- Fonctions de gestion du status -----
-async def save_status_message(message_id: int):
-    """Sauvegarder l'ID du message de status"""
+# ----- Fonctions de gestion du status - CORRIGÉES -----
+async def save_status_message(guild_id: int, message_id: int, channel_id: int):
+    """Sauvegarder l'ID du message de status pour un serveur"""
     async with db_pool.acquire() as conn:
         await conn.execute('''
-            INSERT INTO status_message (id, message_id)
-            VALUES (1, $1)
-            ON CONFLICT (id) 
-            DO UPDATE SET message_id = $1, updated_at = CURRENT_TIMESTAMP
-        ''', message_id)
+            INSERT INTO status_messages (guild_id, message_id, channel_id)
+            VALUES ($1, $2, $3)
+            ON CONFLICT (guild_id) 
+            DO UPDATE SET message_id = $2, channel_id = $3, updated_at = CURRENT_TIMESTAMP
+        ''', guild_id, message_id, channel_id)
 
-async def load_status_message() -> Optional[int]:
-    """Charger l'ID du message de status"""
+async def load_status_messages() -> Dict[int, Dict[str, int]]:
+    """Charger tous les messages de status"""
     async with db_pool.acquire() as conn:
-        return await conn.fetchval("SELECT message_id FROM status_message WHERE id = 1")
+        rows = await conn.fetch("SELECT * FROM status_messages")
+        
+        result = {}
+        for row in rows:
+            result[row["guild_id"]] = {
+                "message_id": row["message_id"],
+                "channel_id": row["channel_id"]
+            }
+        
+        return result
+
+async def get_status_message(guild_id: int) -> Optional[Dict[str, int]]:
+    """Obtenir le message de status pour un serveur"""
+    async with db_pool.acquire() as conn:
+        row = await conn.fetchrow(
+            "SELECT message_id, channel_id FROM status_messages WHERE guild_id = $1", guild_id
+        )
+        
+        if row:
+            return {
+                "message_id": row["message_id"],
+                "channel_id": row["channel_id"]
+            }
+        return None
 
 # ---------------------------------
 # ----- Bot Discord -----
@@ -291,7 +315,7 @@ tree = bot.tree
 ticket_messages = {}
 open_tickets = {}
 close_button_messages = {}
-status_message_id = None
+status_messages = {}
 
 # ----- Fonction de nettoyage immédiat -----
 async def force_clean_guild_tickets(guild_id: int):
@@ -458,131 +482,19 @@ async def create_ticket(user, guild):
     
     return channel
 
-# ----- /ticket commande -----
-@tree.command(description="Créer un ticket privé avec le staff")
-async def ticket(interaction: discord.Interaction):
-    user_id = interaction.user.id
-    guild_id = interaction.guild.id
-    
-    # Vérifier si l'utilisateur a déjà un ticket ouvert sur ce serveur
-    if await user_has_open_ticket(user_id, guild_id):
-        existing_channel_id = await get_user_open_ticket(user_id, guild_id)
-        print(f"Commande /ticket bloquée: utilisateur {user_id} a déjà le ticket {existing_channel_id} sur serveur {guild_id}")
-        await interaction.response.send_message(
-            f"❌ Tu as déjà un ticket ouvert <#{existing_channel_id}> sur ce serveur ! Ferme ton ticket actuel avant d'en créer un nouveau.", 
-            ephemeral=True
-        )
-        return
-
-    guild = interaction.guild
-    if not guild:
-        return await interaction.response.send_message(
-            "Utilise cette commande sur le serveur.", ephemeral=True
-        )
-
-    print(f"Commande /ticket autorisée pour utilisateur {user_id} sur serveur {guild_id}")
-    channel = await create_ticket(interaction.user, guild)
-    await save_open_ticket(user_id, channel.id, guild_id)
-    print(f"Ticket créé via commande: salon {channel.id} pour utilisateur {user_id}")
-    
-    await interaction.response.send_message(
-        f"🎫 Ticket créé : <#{channel.id}>", ephemeral=True
-    )
-
-# ----- /close_ticket -----
-@tree.command(description="[STAFF] Fermer un ticket")
-async def close_ticket(interaction: discord.Interaction):
-    guild = interaction.guild
-    if not guild:
-        return await interaction.response.send_message(
-            "Utilise cette commande sur le serveur.", ephemeral=True
-        )
-
-    if not isinstance(interaction.channel, discord.TextChannel):
-        return await interaction.response.send_message(
-            "❌ Cette commande ne peut être utilisée que dans un salon textuel.",
-            ephemeral=True
-        )
-
-    if not interaction.channel.name.startswith("ticket-"):
-        return await interaction.response.send_message(
-            "❌ Cette commande ne peut être utilisée que dans un ticket.",
-            ephemeral=True
-        )
-
-    server_config = await get_server_config(guild.id)
-    staff_role_id = server_config.get("staff_role_id")
-
-    if staff_role_id:
-        role = guild.get_role(staff_role_id)
-        member = guild.get_member(interaction.user.id)
-        if role and member and role not in member.roles:
-            return await interaction.response.send_message(
-                "❌ Seul le staff peut fermer les tickets.", ephemeral=True
-            )
-
-    await interaction.response.send_message(
-        "🗑️ Fermeture du ticket dans 5 secondes..."
-    )
-    
-    # Sauvegarder les IDs avant suppression
-    channel_id_to_remove = interaction.channel.id
-    guild_id_to_clean = interaction.guild.id
-    
-    await asyncio.sleep(5)
-
-    # Supprimer de la liste des tickets ouverts
-    global open_tickets
-    async with db_pool.acquire() as conn:
-        row = await conn.fetchrow('''
-            SELECT user_id, guild_id FROM open_tickets 
-            WHERE ticket_channel_id = $1
-        ''', channel_id_to_remove)
-        
-        if row:
-            user_id = row["user_id"]
-            guild_id = row["guild_id"]
-            await remove_open_ticket(user_id, guild_id)
-            key = f"{user_id}_{guild_id}"
-            open_tickets.pop(key, None)
-            print(f"Ticket fermé via commande: utilisateur {user_id} sur serveur {guild_id}")
-
-    # Supprimer le message du JSON des boutons de fermeture  
-    for msg_id, data in list(close_button_messages.items()):
-        if data["channel_id"] == channel_id_to_remove:
-            await remove_close_button_message(msg_id)
-            close_button_messages.pop(int(msg_id), None)
-            print(f"Bouton de fermeture supprimé pour le message {msg_id}")
-            break
-
-    # Vérifier que le channel existe encore avant de le supprimer
-    try:
-        channel_to_delete = bot.get_channel(channel_id_to_remove)
-        if channel_to_delete:
-            await channel_to_delete.delete(reason="Ticket fermé par le staff")
-            print(f"Salon {channel_id_to_remove} supprimé avec succès")
-        else:
-            print(f"Salon {channel_id_to_remove} déjà supprimé ou introuvable")
-    except discord.NotFound:
-        print(f"Channel {channel_id_to_remove} déjà supprimé")
-    except Exception as e:
-        print(f"Erreur lors de la suppression du channel: {e}")
-    
-    # Forcer un nettoyage immédiat pour ce serveur
-    await asyncio.sleep(1)  # Petite pause pour que Discord traite la suppression
-    await force_clean_guild_tickets(guild_id_to_clean)
-
-# ----- /config avec bouton -----
+# ----- /config avec bouton ET possibilité de configurer le status -----
 @tree.command(description="[ADMIN] Configurer le système de tickets pour ce serveur")
 @app_commands.describe(
     channel_id="ID du salon où poster le message avec bouton",
     message_text="Texte du message avec bouton",
     ticket_message="Message envoyé dans le ticket (utilise {user} pour mentionner l'utilisateur)",
     staff_role_id="ID du rôle staff (optionnel)",
-    category_name="Nom de la catégorie des tickets (optionnel)"
+    category_name="Nom de la catégorie des tickets (optionnel)",
+    status_channel_id="ID du salon pour les messages de status (optionnel)"
 )
 async def config(interaction: discord.Interaction, channel_id: str, message_text: str, 
-                ticket_message: str = None, staff_role_id: str = None, category_name: str = None):
+                ticket_message: str = None, staff_role_id: str = None, category_name: str = None,
+                status_channel_id: str = None):
     guild = interaction.guild
     if not guild:
         return await interaction.response.send_message(
@@ -619,6 +531,18 @@ async def config(interaction: discord.Interaction, channel_id: str, message_text
             )
     if category_name:
         updates["category_name"] = category_name
+    if status_channel_id:
+        try:
+            status_chan = guild.get_channel(int(status_channel_id))
+            if not status_chan:
+                return await interaction.response.send_message(
+                    "Salon de status introuvable.", ephemeral=True
+                )
+            updates["status_channel_id"] = int(status_channel_id)
+        except:
+            return await interaction.response.send_message(
+                "ID de salon de status invalide.", ephemeral=True
+            )
     
     if updates:
         await update_server_config(guild.id, updates)
@@ -643,88 +567,10 @@ async def config(interaction: discord.Interaction, channel_id: str, message_text
             response_parts.append(f"✅ Rôle staff configuré : {role.mention}")
     if category_name:
         response_parts.append(f"✅ Catégorie des tickets : `{category_name}`")
+    if status_channel_id:
+        response_parts.append(f"✅ Salon de status configuré : <#{status_channel_id}>")
 
     await interaction.response.send_message("\n".join(response_parts), ephemeral=True)
-
-# ----- /debug_tickets pour vérifier l'état -----
-@tree.command(description="[ADMIN] Vérifier l'état des tickets et nettoyer si nécessaire")
-async def debug_tickets(interaction: discord.Interaction):
-    if not interaction.user.guild_permissions.administrator:
-        return await interaction.response.send_message(
-            "❌ Seuls les administrateurs peuvent utiliser cette commande.", ephemeral=True
-        )
-    
-    guild_id = interaction.guild.id
-    user_id = interaction.user.id
-    
-    # Vérifier les tickets ouverts pour ce serveur
-    open_tickets_for_guild = []
-    async with db_pool.acquire() as conn:
-        rows = await conn.fetch("SELECT * FROM open_tickets WHERE guild_id = $1", guild_id)
-        
-        for row in rows:
-            channel_id = row["ticket_channel_id"]
-            channel = interaction.guild.get_channel(channel_id)
-            status = "✅ Existe" if channel else "❌ N'existe plus"
-            open_tickets_for_guild.append(f"- <@{row['user_id']}>: <#{channel_id}> {status}")
-    
-    # Vérifier si l'utilisateur actuel a un ticket
-    user_ticket = await user_has_open_ticket(user_id, guild_id)
-    user_ticket_channel = await get_user_open_ticket(user_id, guild_id)
-    
-    embed = discord.Embed(title="🔍 Debug Tickets", color=0x00ff00)
-    embed.add_field(
-        name="📊 Tickets ouverts sur ce serveur", 
-        value="\n".join(open_tickets_for_guild) if open_tickets_for_guild else "Aucun ticket ouvert", 
-        inline=False
-    )
-    embed.add_field(
-        name="👤 Votre statut", 
-        value=f"Ticket ouvert: {'✅ Oui' if user_ticket else '❌ Non'}\nSalon: {f'<#{user_ticket_channel}>' if user_ticket_channel else 'Aucun'}", 
-        inline=False
-    )
-    embed.add_field(
-        name="🧹 Actions", 
-        value="Utilise `/force_clean_tickets` si tu vois des tickets qui n'existent plus", 
-        inline=False
-    )
-    
-    await interaction.response.send_message(embed=embed, ephemeral=True)
-
-# ----- /force_clean_tickets pour forcer le nettoyage -----
-@tree.command(description="[ADMIN] Forcer le nettoyage des tickets inexistants")
-async def force_clean_tickets(interaction: discord.Interaction):
-    if not interaction.user.guild_permissions.administrator:
-        return await interaction.response.send_message(
-            "❌ Seuls les administrateurs peuvent utiliser cette commande.", ephemeral=True
-        )
-    
-    await interaction.response.defer(ephemeral=True)
-    
-    guild_id = interaction.guild.id
-    cleaned_count = 0
-    
-    # Nettoyer les tickets de ce serveur
-    global open_tickets
-    async with db_pool.acquire() as conn:
-        rows = await conn.fetch("SELECT * FROM open_tickets WHERE guild_id = $1", guild_id)
-        
-        for row in rows:
-            channel_id = row["ticket_channel_id"]
-            user_id = row["user_id"]
-            channel = interaction.guild.get_channel(channel_id)
-            
-            if not channel:
-                await remove_open_ticket(user_id, guild_id)
-                key = f"{user_id}_{guild_id}"
-                open_tickets.pop(key, None)
-                cleaned_count += 1
-                print(f"Nettoyage forcé: ticket {key} supprimé")
-    
-    await interaction.followup.send(
-        f"🧹 Nettoyage terminé ! **{cleaned_count}** ticket(s) inexistant(s) supprimé(s).", 
-        ephemeral=True
-    )
 
 # ----- Vérification automatique des messages de tickets (toutes les heures) -----
 @tasks.loop(hours=1)
@@ -794,47 +640,67 @@ async def check_tickets():
             print(f"Ticket {key} supprimé de la DB car le salon {channel_id} n'existe plus dans {guild.name}.")
             continue
 
-# ----- Update status -----
+# ----- Update status - CORRIGÉ -----
 @tasks.loop(minutes=5)
 async def update_status():
-    global status_message_id
+    """Mettre à jour les messages de status pour tous les serveurs configurés"""
+    global status_messages
     
-    # Trouver le premier serveur qui a un status_channel_id configuré
+    # Charger les messages de status depuis la DB
+    status_messages = await load_status_messages()
+    
+    # Vérifier les serveurs qui ont un status_channel_id configuré
     async with db_pool.acquire() as conn:
-        row = await conn.fetchrow('''
-            SELECT status_channel_id FROM servers_config 
-            WHERE status_channel_id IS NOT NULL 
-            LIMIT 1
+        rows = await conn.fetch('''
+            SELECT guild_id, status_channel_id FROM servers_config 
+            WHERE status_channel_id IS NOT NULL
         ''')
         
-        if not row:
-            return
-        
-        status_channel_id = row["status_channel_id"]
-        
-    channel = bot.get_channel(status_channel_id)
-    if not channel:
-        return
-        
-    if not status_message_id:
-        msg = await channel.send("✅ Bot en ligne")
-        status_message_id = msg.id
-        await save_status_message(status_message_id)
-    else:
-        try:
-            msg = await channel.fetch_message(status_message_id)
-            await msg.edit(
-                content=f"✅ Bot toujours en ligne (maj <t:{int(discord.utils.utcnow().timestamp())}:R>)"
-            )
-        except:
-            msg = await channel.send("✅ Bot en ligne")
-            status_message_id = msg.id
-            await save_status_message(status_message_id)
+        for row in rows:
+            guild_id = row["guild_id"]
+            status_channel_id = row["status_channel_id"]
+            
+            guild = bot.get_guild(guild_id)
+            if not guild:
+                continue
+                
+            channel = guild.get_channel(status_channel_id)
+            if not channel:
+                continue
+            
+            current_time = int(discord.utils.utcnow().timestamp())
+            
+            # Vérifier si on a déjà un message de status pour ce serveur
+            if guild_id in status_messages:
+                message_id = status_messages[guild_id]["message_id"]
+                try:
+                    msg = await channel.fetch_message(message_id)
+                    await msg.edit(
+                        content=f"✅ Bot en ligne - Dernière mise à jour: <t:{current_time}:R>"
+                    )
+                    print(f"Message de status mis à jour pour {guild.name}")
+                except discord.NotFound:
+                    # Le message n'existe plus, en créer un nouveau
+                    msg = await channel.send(f"✅ Bot en ligne - <t:{current_time}:R>")
+                    await save_status_message(guild_id, msg.id, channel.id)
+                    status_messages[guild_id] = {"message_id": msg.id, "channel_id": channel.id}
+                    print(f"Nouveau message de status créé pour {guild.name}")
+                except Exception as e:
+                    print(f"Erreur lors de la mise à jour du status pour {guild.name}: {e}")
+            else:
+                # Pas de message de status existant, en créer un nouveau
+                try:
+                    msg = await channel.send(f"✅ Bot en ligne - <t:{current_time}:R>")
+                    await save_status_message(guild_id, msg.id, channel.id)
+                    status_messages[guild_id] = {"message_id": msg.id, "channel_id": channel.id}
+                    print(f"Premier message de status créé pour {guild.name}")
+                except Exception as e:
+                    print(f"Erreur lors de la création du message de status pour {guild.name}: {e}")
 
 # ----- on_ready -----
 @bot.event
 async def on_ready():
-    global status_message_id, ticket_messages, open_tickets, close_button_messages
+    global status_messages, ticket_messages, open_tickets, close_button_messages
     
     # Initialiser la base de données
     await init_database()
@@ -846,6 +712,7 @@ async def on_ready():
     ticket_messages = await load_ticket_messages()
     open_tickets = await load_open_tickets()
     close_button_messages = await load_close_button_messages()
+    status_messages = await load_status_messages()
 
     # Restaurer les boutons des messages de ticket pour tous les serveurs
     for guild_id, messages in ticket_messages.items():
@@ -878,32 +745,51 @@ async def on_ready():
                 except Exception as e:
                     print(f"Erreur lors de la restauration du bouton de fermeture {msg_id}: {e}")
 
-    # Gérer le message de status
-    status_message_id = await load_status_message()
-    
+    # Initialiser les messages de status pour les serveurs configurés
     async with db_pool.acquire() as conn:
-        row = await conn.fetchrow('''
-            SELECT status_channel_id FROM servers_config 
-            WHERE status_channel_id IS NOT NULL 
-            LIMIT 1
+        rows = await conn.fetch('''
+            SELECT guild_id, status_channel_id FROM servers_config 
+            WHERE status_channel_id IS NOT NULL
         ''')
         
-        if row:
+        current_time = int(discord.utils.utcnow().timestamp())
+        
+        for row in rows:
+            guild_id = row["status_channel_id"] 
             status_channel_id = row["status_channel_id"]
-            channel = bot.get_channel(status_channel_id)
-            if channel:
-                if status_message_id:
-                    try:
-                        msg = await channel.fetch_message(status_message_id)
-                        await msg.edit(content="✅ Bot en ligne (redémarré)")
-                    except:
-                        msg = await channel.send("✅ Bot en ligne")
-                        status_message_id = msg.id
-                        await save_status_message(status_message_id)
-                else:
-                    msg = await channel.send("✅ Bot en ligne")
-                    status_message_id = msg.id
-                    await save_status_message(status_message_id)
+            
+            guild = bot.get_guild(guild_id)
+            if not guild:
+                continue
+                
+            channel = guild.get_channel(status_channel_id)
+            if not channel:
+                continue
+            
+            # Vérifier si on a déjà un message de status en DB
+            if guild_id in status_messages:
+                message_id = status_messages[guild_id]["message_id"]
+                try:
+                    msg = await channel.fetch_message(message_id)
+                    await msg.edit(content=f"✅ Bot en ligne (redémarré) - <t:{current_time}:R>")
+                    print(f"Message de status restauré pour {guild.name}")
+                except discord.NotFound:
+                    # Le message n'existe plus, en créer un nouveau
+                    msg = await channel.send(f"✅ Bot en ligne (redémarré) - <t:{current_time}:R>")
+                    await save_status_message(guild_id, msg.id, channel.id)
+                    status_messages[guild_id] = {"message_id": msg.id, "channel_id": channel.id}
+                    print(f"Nouveau message de status créé pour {guild.name}")
+                except Exception as e:
+                    print(f"Erreur lors de la restauration du status pour {guild.name}: {e}")
+            else:
+                # Pas de message de status existant, en créer un nouveau
+                try:
+                    msg = await channel.send(f"✅ Bot en ligne (redémarré) - <t:{current_time}:R>")
+                    await save_status_message(guild_id, msg.id, channel.id)
+                    status_messages[guild_id] = {"message_id": msg.id, "channel_id": channel.id}
+                    print(f"Premier message de status créé pour {guild.name}")
+                except Exception as e:
+                    print(f"Erreur lors de la création du message de status pour {guild.name}: {e}")
 
     # Démarrer les tâches
     update_status.start()
@@ -912,6 +798,7 @@ async def on_ready():
     
     print(f"Bot prêt ! Configuré sur {len(ticket_messages)} serveur(s) avec des messages de tickets.")
     print(f"Tickets ouverts actuellement: {len(open_tickets)}")
+    print(f"Messages de status configurés: {len(status_messages)}")
     
     # Afficher un résumé des serveurs configurés
     for guild_id, messages in ticket_messages.items():
@@ -958,7 +845,7 @@ if __name__ == "__main__":
     
     token = os.getenv("DISCORD_TOKEN")
     if not token:
-        print("❌ DISCORD_TOKEN_TICKET manquant dans les variables d'environnement")
+        print("❌ DISCORD_TOKEN manquant dans les variables d'environnement")
         exit(1)
     
     try:
