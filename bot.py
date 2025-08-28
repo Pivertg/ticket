@@ -5,80 +5,84 @@ from discord.ext import commands, tasks
 import asyncio
 import json
 import time
-import asyncpg
+import psycopg2
+import psycopg2.extras
 from typing import Optional, Dict, Any
 
 # ---------------------------------
 # ----- Configuration PostgreSQL -----
 DATABASE_URL = os.getenv("DATABASE_URL")
 
-# Pool de connexions PostgreSQL
-db_pool = None
+# Connexion PostgreSQL
+conn = None
+cursor = None
 
-async def init_database():
+def init_database():
     """Initialiser la base de données PostgreSQL et créer les tables"""
-    global db_pool
+    global conn, cursor
     
     if not DATABASE_URL:
         raise ValueError("❌ DATABASE_URL manquant dans les variables d'environnement")
     
-    # Créer le pool de connexions
-    db_pool = await asyncpg.create_pool(DATABASE_URL, min_size=1, max_size=10)
+    # Connexion
+    conn = psycopg2.connect(DATABASE_URL, sslmode="require")
+    cursor = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
     
-    # Créer les tables si elles n'existent pas
-    async with db_pool.acquire() as conn:
-        # Table pour la configuration des serveurs
-        await conn.execute('''
-            CREATE TABLE IF NOT EXISTS servers_config (
-                guild_id BIGINT PRIMARY KEY,
-                category_name VARCHAR(255) DEFAULT 'TICKETS',
-                staff_role_id BIGINT,
-                ticket_message TEXT DEFAULT '{user} Merci d''avoir ouvert un ticket. Un membre du staff va te répondre.',
-                status_channel_id BIGINT,
-                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-            )
-        ''')
-        
-        # Table pour les messages avec boutons de tickets
-        await conn.execute('''
-            CREATE TABLE IF NOT EXISTS ticket_messages (
-                message_id BIGINT,
-                guild_id BIGINT,
-                channel_id BIGINT,
-                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                PRIMARY KEY (message_id, guild_id)
-            )
-        ''')
-        
-        # Table pour les tickets ouverts
-        await conn.execute('''
-            CREATE TABLE IF NOT EXISTS open_tickets (
-                user_id BIGINT,
-                guild_id BIGINT,
-                ticket_channel_id BIGINT,
-                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                PRIMARY KEY (user_id, guild_id)
-            )
-        ''')
-        
-        # Table pour les messages de fermeture
-        await conn.execute('''
-            CREATE TABLE IF NOT EXISTS close_button_messages (
-                message_id BIGINT PRIMARY KEY,
-                channel_id BIGINT,
-                guild_id BIGINT,
-                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-            )
-        ''')
-        
-        # Table pour le message de status
-        await conn.execute('''
-            CREATE TABLE IF NOT EXISTS status_message (
-                id INTEGER PRIMARY KEY DEFAULT 1,
-                message_id BIGINT,
-                updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-            )
-        ''')
+    # Table pour la configuration des serveurs
+    cursor.execute('''
+        CREATE TABLE IF NOT EXISTS servers_config (
+            guild_id BIGINT PRIMARY KEY,
+            category_name VARCHAR(255) DEFAULT 'TICKETS',
+            staff_role_id BIGINT,
+            ticket_message TEXT DEFAULT '{user} Merci d''avoir ouvert un ticket. Un membre du staff va te répondre.',
+            status_channel_id BIGINT,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        )
+    ''')
+    
+    # Table pour les messages avec boutons de tickets
+    cursor.execute('''
+        CREATE TABLE IF NOT EXISTS ticket_messages (
+            message_id BIGINT,
+            guild_id BIGINT,
+            channel_id BIGINT,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            PRIMARY KEY (message_id, guild_id)
+        )
+    ''')
+    
+    # Table pour les tickets ouverts
+    cursor.execute('''
+        CREATE TABLE IF NOT EXISTS open_tickets (
+            user_id BIGINT,
+            guild_id BIGINT,
+            ticket_channel_id BIGINT,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            PRIMARY KEY (user_id, guild_id)
+        )
+    ''')
+    
+    # Table pour les messages de fermeture
+    cursor.execute('''
+        CREATE TABLE IF NOT EXISTS close_button_messages (
+            message_id BIGINT PRIMARY KEY,
+            channel_id BIGINT,
+            guild_id BIGINT,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        )
+    ''')
+    
+    # Table pour le message de status
+    cursor.execute('''
+        CREATE TABLE IF NOT EXISTS status_message (
+            id INTEGER PRIMARY KEY DEFAULT 1,
+            message_id BIGINT,
+            updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        )
+    ''')
+    
+    # Valider les changements
+    conn.commit()
     
     print("✅ Base de données PostgreSQL initialisée")
 
