@@ -5,110 +5,82 @@ from discord.ext import commands, tasks
 import asyncio
 import json
 import time
-import psycopg2
-import psycopg2.extras
+import asyncpg
 from typing import Optional, Dict, Any
-
-DATABASE_URL = os.getenv("DATABASE_URL")
-
-# ----- Connexion PostgreSQL (synchrone) -----
-conn = psycopg2.connect(DATABASE_URL, cursor_factory=psycopg2.extras.DictCursor)
-cursor = conn.cursor()
-
-# ----- Bot Discord -----
-intents = discord.Intents.default()
-intents.guilds = True
-bot = commands.Bot(command_prefix="!", intents=intents)
-tree = bot.tree
-
-# ----- Fonction utilitaire pour exécuter DB en thread -----
-async def db_execute(query, *args):
-    def run_query():
-        cursor.execute(query, args)
-        if query.strip().upper().startswith("SELECT"):
-            return cursor.fetchall()
-        else:
-            conn.commit()
-            return None
-    return await asyncio.to_thread(run_query)
 
 # ---------------------------------
 # ----- Configuration PostgreSQL -----
 DATABASE_URL = os.getenv("DATABASE_URL")
 
-# Connexion PostgreSQL
-conn = None
-cursor = None
+# Pool de connexions PostgreSQL
+db_pool = None
 
-def init_database():
+async def init_database():
     """Initialiser la base de données PostgreSQL et créer les tables"""
-    global conn, cursor
+    global db_pool
     
     if not DATABASE_URL:
         raise ValueError("❌ DATABASE_URL manquant dans les variables d'environnement")
     
-    # Connexion
-    conn = psycopg2.connect(DATABASE_URL, sslmode="require")
-    cursor = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+    # Créer le pool de connexions
+    db_pool = await asyncpg.create_pool(DATABASE_URL, min_size=1, max_size=10)
     
-    # Table pour la configuration des serveurs
-    cursor.execute('''
-        CREATE TABLE IF NOT EXISTS servers_config (
-            guild_id BIGINT PRIMARY KEY,
-            category_name VARCHAR(255) DEFAULT 'TICKETS',
-            staff_role_id BIGINT,
-            ticket_message TEXT DEFAULT '{user} Merci d''avoir ouvert un ticket. Un membre du staff va te répondre.',
-            status_channel_id BIGINT,
-            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-        )
-    ''')
-    
-    # Table pour les messages avec boutons de tickets
-    cursor.execute('''
-        CREATE TABLE IF NOT EXISTS ticket_messages (
-            message_id BIGINT,
-            guild_id BIGINT,
-            channel_id BIGINT,
-            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-            PRIMARY KEY (message_id, guild_id)
-        )
-    ''')
-    
-    # Table pour les tickets ouverts
-    cursor.execute('''
-        CREATE TABLE IF NOT EXISTS open_tickets (
-            user_id BIGINT,
-            guild_id BIGINT,
-            ticket_channel_id BIGINT,
-            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-            PRIMARY KEY (user_id, guild_id)
-        )
-    ''')
-    
-    # Table pour les messages de fermeture
-    cursor.execute('''
-        CREATE TABLE IF NOT EXISTS close_button_messages (
-            message_id BIGINT PRIMARY KEY,
-            channel_id BIGINT,
-            guild_id BIGINT,
-            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-        )
-    ''')
-    
-    # Table pour le message de status
-    cursor.execute('''
-        CREATE TABLE IF NOT EXISTS status_message (
-            id INTEGER PRIMARY KEY DEFAULT 1,
-            message_id BIGINT,
-            updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-        )
-    ''')
-    
-    # Valider les changements
-    conn.commit()
+    # Créer les tables si elles n'existent pas
+    async with db_pool.acquire() as conn:
+        # Table pour la configuration des serveurs
+        await conn.execute('''
+            CREATE TABLE IF NOT EXISTS servers_config (
+                guild_id BIGINT PRIMARY KEY,
+                category_name VARCHAR(255) DEFAULT 'TICKETS',
+                staff_role_id BIGINT,
+                ticket_message TEXT DEFAULT '{user} Merci d''avoir ouvert un ticket. Un membre du staff va te répondre.',
+                status_channel_id BIGINT,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )
+        ''')
+        
+        # Table pour les messages avec boutons de tickets
+        await conn.execute('''
+            CREATE TABLE IF NOT EXISTS ticket_messages (
+                message_id BIGINT,
+                guild_id BIGINT,
+                channel_id BIGINT,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                PRIMARY KEY (message_id, guild_id)
+            )
+        ''')
+        
+        # Table pour les tickets ouverts
+        await conn.execute('''
+            CREATE TABLE IF NOT EXISTS open_tickets (
+                user_id BIGINT,
+                guild_id BIGINT,
+                ticket_channel_id BIGINT,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                PRIMARY KEY (user_id, guild_id)
+            )
+        ''')
+        
+        # Table pour les messages de fermeture
+        await conn.execute('''
+            CREATE TABLE IF NOT EXISTS close_button_messages (
+                message_id BIGINT PRIMARY KEY,
+                channel_id BIGINT,
+                guild_id BIGINT,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )
+        ''')
+        
+        # Table pour le message de status
+        await conn.execute('''
+            CREATE TABLE IF NOT EXISTS status_message (
+                id INTEGER PRIMARY KEY DEFAULT 1,
+                message_id BIGINT,
+                updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )
+        ''')
     
     print("✅ Base de données PostgreSQL initialisée")
-
 
 # ----- Fonctions de gestion de la configuration des serveurs -----
 async def get_server_config(guild_id: int) -> Dict[str, Any]:
@@ -893,8 +865,8 @@ async def on_ready():
     
     # Restaurer les boutons de fermeture des tickets
     for msg_id, data in close_button_messages.items():
-        channel_id = data.get("channel_id")
-        guild_id = data.get("guild_id")
+        channel_id = data["channel_id"]
+        guild_id = data["guild_id"]
         guild = bot.get_guild(guild_id)
         if guild:
             channel = guild.get_channel(channel_id)
@@ -909,29 +881,29 @@ async def on_ready():
     # Gérer le message de status
     status_message_id = await load_status_message()
     
-    if status_message_id is None:
-        status_message_id = 0
-
-    row = await db_execute('''
-        SELECT status_channel_id FROM servers_config 
-        WHERE status_channel_id IS NOT NULL 
-        LIMIT 1
-    ''')
-    
-    if row:
-        status_channel_id = row[0]["status_channel_id"]
-        channel = bot.get_channel(status_channel_id)
-        if channel:
-            try:
+    async with db_pool.acquire() as conn:
+        row = await conn.fetchrow('''
+            SELECT status_channel_id FROM servers_config 
+            WHERE status_channel_id IS NOT NULL 
+            LIMIT 1
+        ''')
+        
+        if row:
+            status_channel_id = row["status_channel_id"]
+            channel = bot.get_channel(status_channel_id)
+            if channel:
                 if status_message_id:
-                    msg = await channel.fetch_message(status_message_id)
-                    await msg.edit(content="✅ Bot en ligne (redémarré)")
+                    try:
+                        msg = await channel.fetch_message(status_message_id)
+                        await msg.edit(content="✅ Bot en ligne (redémarré)")
+                    except:
+                        msg = await channel.send("✅ Bot en ligne")
+                        status_message_id = msg.id
+                        await save_status_message(status_message_id)
                 else:
                     msg = await channel.send("✅ Bot en ligne")
                     status_message_id = msg.id
                     await save_status_message(status_message_id)
-            except Exception as e:
-                print(f"Erreur lors de l'envoi du message de status: {e}")
 
     # Démarrer les tâches
     update_status.start()
@@ -951,10 +923,25 @@ async def on_ready():
 # ----- Gestion propre de la fermeture -----
 async def cleanup_on_exit():
     """Fermer proprement la connexion à la base de données"""
-    global conn
-    if conn:
-        conn.close()
+    global db_pool
+    if db_pool:
+        await db_pool.close()
         print("🔌 Connexion PostgreSQL fermée")
+
+# ----- Keep alive pour Render -----
+import threading
+from flask import Flask
+
+app = Flask("")
+
+@app.route("/")
+def home():
+    return "Bot en ligne !"
+
+def run_flask():
+    app.run(host="0.0.0.0", port=10000)
+
+threading.Thread(target=run_flask).start()
 
 # ----- Lancement du bot -----
 if __name__ == "__main__":
@@ -969,7 +956,7 @@ if __name__ == "__main__":
     signal.signal(signal.SIGINT, signal_handler)
     signal.signal(signal.SIGTERM, signal_handler)
     
-    token = os.getenv("DISCORD_TOKEN_TICKET")
+    token = os.getenv("DISCORD_TOKEN")
     if not token:
         print("❌ DISCORD_TOKEN_TICKET manquant dans les variables d'environnement")
         exit(1)
