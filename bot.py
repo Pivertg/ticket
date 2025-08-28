@@ -9,6 +9,29 @@ import psycopg2
 import psycopg2.extras
 from typing import Optional, Dict, Any
 
+DATABASE_URL = os.getenv("DATABASE_URL")
+
+# ----- Connexion PostgreSQL (synchrone) -----
+conn = psycopg2.connect(DATABASE_URL, cursor_factory=psycopg2.extras.DictCursor)
+cursor = conn.cursor()
+
+# ----- Bot Discord -----
+intents = discord.Intents.default()
+intents.guilds = True
+bot = commands.Bot(command_prefix="!", intents=intents)
+tree = bot.tree
+
+# ----- Fonction utilitaire pour exécuter DB en thread -----
+async def db_execute(query, *args):
+    def run_query():
+        cursor.execute(query, args)
+        if query.strip().upper().startswith("SELECT"):
+            return cursor.fetchall()
+        else:
+            conn.commit()
+            return None
+    return await asyncio.to_thread(run_query)
+
 # ---------------------------------
 # ----- Configuration PostgreSQL -----
 DATABASE_URL = os.getenv("DATABASE_URL")
@@ -85,6 +108,7 @@ def init_database():
     conn.commit()
     
     print("✅ Base de données PostgreSQL initialisée")
+
 
 # ----- Fonctions de gestion de la configuration des serveurs -----
 async def get_server_config(guild_id: int) -> Dict[str, Any]:
@@ -869,8 +893,8 @@ async def on_ready():
     
     # Restaurer les boutons de fermeture des tickets
     for msg_id, data in close_button_messages.items():
-        channel_id = data["channel_id"]
-        guild_id = data["guild_id"]
+        channel_id = data.get("channel_id")
+        guild_id = data.get("guild_id")
         guild = bot.get_guild(guild_id)
         if guild:
             channel = guild.get_channel(channel_id)
@@ -885,29 +909,29 @@ async def on_ready():
     # Gérer le message de status
     status_message_id = await load_status_message()
     
-    async with db_pool.acquire() as conn:
-        row = await conn.fetchrow('''
-            SELECT status_channel_id FROM servers_config 
-            WHERE status_channel_id IS NOT NULL 
-            LIMIT 1
-        ''')
-        
-        if row:
-            status_channel_id = row["status_channel_id"]
-            channel = bot.get_channel(status_channel_id)
-            if channel:
+    if status_message_id is None:
+        status_message_id = 0
+
+    row = await db_execute('''
+        SELECT status_channel_id FROM servers_config 
+        WHERE status_channel_id IS NOT NULL 
+        LIMIT 1
+    ''')
+    
+    if row:
+        status_channel_id = row[0]["status_channel_id"]
+        channel = bot.get_channel(status_channel_id)
+        if channel:
+            try:
                 if status_message_id:
-                    try:
-                        msg = await channel.fetch_message(status_message_id)
-                        await msg.edit(content="✅ Bot en ligne (redémarré)")
-                    except:
-                        msg = await channel.send("✅ Bot en ligne")
-                        status_message_id = msg.id
-                        await save_status_message(status_message_id)
+                    msg = await channel.fetch_message(status_message_id)
+                    await msg.edit(content="✅ Bot en ligne (redémarré)")
                 else:
                     msg = await channel.send("✅ Bot en ligne")
                     status_message_id = msg.id
                     await save_status_message(status_message_id)
+            except Exception as e:
+                print(f"Erreur lors de l'envoi du message de status: {e}")
 
     # Démarrer les tâches
     update_status.start()
@@ -927,9 +951,9 @@ async def on_ready():
 # ----- Gestion propre de la fermeture -----
 async def cleanup_on_exit():
     """Fermer proprement la connexion à la base de données"""
-    global db_pool
-    if db_pool:
-        await db_pool.close()
+    global conn
+    if conn:
+        conn.close()
         print("🔌 Connexion PostgreSQL fermée")
 
 # ----- Lancement du bot -----
