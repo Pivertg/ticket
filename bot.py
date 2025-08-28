@@ -103,6 +103,7 @@ def remove_ticket_message(guild_id, message_id):
         save_ticket_messages(ticket_messages)
 
 def save_open_ticket(user_id, channel_id, guild_id):
+    """Sauvegarder un ticket ouvert"""
     data = {}
     if os.path.exists(OPEN_TICKETS_FILE):
         with open(OPEN_TICKETS_FILE, "r", encoding="utf-8") as f:
@@ -113,17 +114,20 @@ def save_open_ticket(user_id, channel_id, guild_id):
     
     # Clé unique : user_id + guild_id pour permettre un ticket par serveur
     key = f"{user_id}_{guild_id}"
-    if key not in data:
-        data[key] = {
-            "user_id": user_id,
-            "guild_id": guild_id,
-            "ticket_channel_id": channel_id,
-            "created_at": int(time.time())
-        }
+    data[key] = {
+        "user_id": user_id,
+        "guild_id": guild_id,
+        "ticket_channel_id": channel_id,
+        "created_at": int(time.time())
+    }
+    
     with open(OPEN_TICKETS_FILE, "w", encoding="utf-8") as f:
         json.dump(data, f, indent=4, ensure_ascii=False)
+    
+    print(f"Ticket sauvegardé: utilisateur {user_id} sur serveur {guild_id} -> salon {channel_id}")
 
 def remove_open_ticket(user_id, guild_id):
+    """Supprimer un ticket ouvert"""
     if not os.path.exists(OPEN_TICKETS_FILE):
         return
     with open(OPEN_TICKETS_FILE, "r", encoding="utf-8") as f:
@@ -132,9 +136,13 @@ def remove_open_ticket(user_id, guild_id):
         except:
             data = {}
     key = f"{user_id}_{guild_id}"
-    data.pop(key, None)
-    with open(OPEN_TICKETS_FILE, "w", encoding="utf-8") as f:
-        json.dump(data, f, indent=4, ensure_ascii=False)
+    if key in data:
+        data.pop(key, None)
+        with open(OPEN_TICKETS_FILE, "w", encoding="utf-8") as f:
+            json.dump(data, f, indent=4, ensure_ascii=False)
+        print(f"Ticket supprimé du JSON: utilisateur {user_id} sur serveur {guild_id}")
+    else:
+        print(f"Ticket non trouvé dans le JSON: utilisateur {user_id} sur serveur {guild_id}")
 
 def load_open_tickets():
     try:
@@ -210,6 +218,30 @@ ticket_messages = load_ticket_messages()
 open_tickets = load_open_tickets()
 close_button_messages = load_close_button_messages()
 
+# ----- Fonction de nettoyage immédiat -----
+async def force_clean_guild_tickets(guild_id):
+    """Nettoyer immédiatement les tickets inexistants pour un serveur"""
+    global open_tickets
+    guild = bot.get_guild(guild_id)
+    if not guild:
+        return
+    
+    to_remove = []
+    for key, ticket_data in open_tickets.items():
+        if ticket_data["guild_id"] == guild_id:
+            channel_id = ticket_data["ticket_channel_id"]
+            channel = guild.get_channel(channel_id)
+            if not channel:
+                user_id = ticket_data["user_id"]
+                remove_open_ticket(user_id, guild_id)
+                to_remove.append(key)
+                print(f"Nettoyage immédiat: ticket {key} supprimé")
+    
+    for key in to_remove:
+        open_tickets.pop(key, None)
+    
+    print(f"Nettoyage immédiat terminé pour le serveur {guild.name}: {len(to_remove)} ticket(s) nettoyé(s)")
+
 # ----- Vue bouton ticket -----
 class TicketButton(discord.ui.View):
     def __init__(self):
@@ -223,14 +255,17 @@ class TicketButton(discord.ui.View):
         # Vérifier si l'utilisateur a déjà un ticket ouvert sur ce serveur
         if user_has_open_ticket(user_id, guild_id):
             existing_channel_id = get_user_open_ticket(user_id, guild_id)
+            print(f"Tentative d'ouverture de ticket bloquée: utilisateur {user_id} a déjà le ticket {existing_channel_id} sur serveur {guild_id}")
             await interaction.response.send_message(
                 f"❌ Tu as déjà un ticket ouvert <#{existing_channel_id}> sur ce serveur ! Ferme ton ticket actuel avant d'en créer un nouveau.", 
                 ephemeral=True
             )
             return
 
+        print(f"Création de ticket autorisée pour utilisateur {user_id} sur serveur {guild_id}")
         channel = await create_ticket(interaction.user, interaction.guild)
         save_open_ticket(user_id, channel.id, guild_id)
+        print(f"Ticket créé avec succès: salon {channel.id} pour utilisateur {user_id}")
         await interaction.response.send_message(f"🎫 Ticket créé ! <#{channel.id}>", ephemeral=True)
 
 # ----- Vue bouton fermeture ticket -----
@@ -262,17 +297,25 @@ class CloseTicketButton(discord.ui.View):
         await interaction.response.send_message(
             "🗑️ Fermeture du ticket dans 5 secondes..."
         )
+        
+        # Sauvegarder les IDs avant suppression
+        channel_id_to_remove = interaction.channel.id
+        guild_id_to_clean = interaction.guild.id
+        
         await asyncio.sleep(5)
 
         # Supprimer de la liste des tickets ouverts
         global open_tickets
+        channel_id_to_remove = interaction.channel.id
         to_remove = []
+        
         for key, ticket_data in open_tickets.items():
-            if ticket_data["ticket_channel_id"] == interaction.channel.id:
+            if ticket_data["ticket_channel_id"] == channel_id_to_remove:
                 user_id = ticket_data["user_id"]
                 guild_id = ticket_data["guild_id"]
                 remove_open_ticket(user_id, guild_id)
                 to_remove.append(key)
+                print(f"Ticket fermé: utilisateur {user_id} sur serveur {guild_id}")
                 break
         
         for key in to_remove:
@@ -280,16 +323,22 @@ class CloseTicketButton(discord.ui.View):
 
         # Supprimer le message du JSON des boutons de fermeture  
         for msg_id, data in list(close_button_messages.items()):
-            if data["channel_id"] == interaction.channel.id:
+            if data["channel_id"] == channel_id_to_remove:
                 remove_close_button_message(msg_id)
                 close_button_messages.pop(int(msg_id), None)
+                print(f"Bouton de fermeture supprimé pour le message {msg_id}")
                 break
 
         # Vérifier que le channel existe encore avant de le supprimer
         try:
-            await interaction.channel.delete(reason="Ticket fermé par le staff")
+            channel_to_delete = bot.get_channel(channel_id_to_remove)
+            if channel_to_delete:
+                await channel_to_delete.delete(reason="Ticket fermé par le staff")
+                print(f"Salon {channel_id_to_remove} supprimé avec succès")
+            else:
+                print(f"Salon {channel_id_to_remove} déjà supprimé ou introuvable")
         except discord.NotFound:
-            print(f"Channel {interaction.channel.id} déjà supprimé")
+            print(f"Channel {channel_id_to_remove} déjà supprimé")
         except Exception as e:
             print(f"Erreur lors de la suppression du channel: {e}")
 
@@ -340,6 +389,7 @@ async def ticket(interaction: discord.Interaction):
     # Vérifier si l'utilisateur a déjà un ticket ouvert sur ce serveur
     if user_has_open_ticket(user_id, guild_id):
         existing_channel_id = get_user_open_ticket(user_id, guild_id)
+        print(f"Commande /ticket bloquée: utilisateur {user_id} a déjà le ticket {existing_channel_id} sur serveur {guild_id}")
         await interaction.response.send_message(
             f"❌ Tu as déjà un ticket ouvert <#{existing_channel_id}> sur ce serveur ! Ferme ton ticket actuel avant d'en créer un nouveau.", 
             ephemeral=True
@@ -352,8 +402,10 @@ async def ticket(interaction: discord.Interaction):
             "Utilise cette commande sur le serveur.", ephemeral=True
         )
 
+    print(f"Commande /ticket autorisée pour utilisateur {user_id} sur serveur {guild_id}")
     channel = await create_ticket(interaction.user, guild)
     save_open_ticket(user_id, channel.id, guild_id)
+    print(f"Ticket créé via commande: salon {channel.id} pour utilisateur {user_id}")
     
     await interaction.response.send_message(
         f"🎫 Ticket créé : <#{channel.id}>", ephemeral=True
@@ -394,17 +446,25 @@ async def close_ticket(interaction: discord.Interaction):
     await interaction.response.send_message(
         "🗑️ Fermeture du ticket dans 5 secondes..."
     )
+    
+    # Sauvegarder les IDs avant suppression
+    channel_id_to_remove = interaction.channel.id
+    guild_id_to_clean = interaction.guild.id
+    
     await asyncio.sleep(5)
 
     # Supprimer de la liste des tickets ouverts
     global open_tickets
+    channel_id_to_remove = interaction.channel.id
     to_remove = []
+    
     for key, ticket_data in open_tickets.items():
-        if ticket_data["ticket_channel_id"] == interaction.channel.id:
+        if ticket_data["ticket_channel_id"] == channel_id_to_remove:
             user_id = ticket_data["user_id"]
             guild_id = ticket_data["guild_id"]
             remove_open_ticket(user_id, guild_id)
             to_remove.append(key)
+            print(f"Ticket fermé via commande: utilisateur {user_id} sur serveur {guild_id}")
             break
     
     for key in to_remove:
@@ -412,18 +472,28 @@ async def close_ticket(interaction: discord.Interaction):
 
     # Supprimer le message du JSON des boutons de fermeture  
     for msg_id, data in list(close_button_messages.items()):
-        if data["channel_id"] == interaction.channel.id:
+        if data["channel_id"] == channel_id_to_remove:
             remove_close_button_message(msg_id)
             close_button_messages.pop(int(msg_id), None)
+            print(f"Bouton de fermeture supprimé pour le message {msg_id}")
             break
 
     # Vérifier que le channel existe encore avant de le supprimer
     try:
-        await interaction.channel.delete(reason="Ticket fermé par le staff")
+        channel_to_delete = bot.get_channel(channel_id_to_remove)
+        if channel_to_delete:
+            await channel_to_delete.delete(reason="Ticket fermé par le staff")
+            print(f"Salon {channel_id_to_remove} supprimé avec succès")
+        else:
+            print(f"Salon {channel_id_to_remove} déjà supprimé ou introuvable")
     except discord.NotFound:
-        print(f"Channel {interaction.channel.id} déjà supprimé")
+        print(f"Channel {channel_id_to_remove} déjà supprimé")
     except Exception as e:
         print(f"Erreur lors de la suppression du channel: {e}")
+    
+    # Forcer un nettoyage immédiat pour ce serveur
+    await asyncio.sleep(1)  # Petite pause pour que Discord traite la suppression
+    await force_clean_guild_tickets(guild_id_to_clean)
 
 # ----- /config avec bouton -----
 @tree.command(description="[ADMIN] Configurer le système de tickets pour ce serveur")
@@ -499,6 +569,84 @@ async def config(interaction: discord.Interaction, channel_id: str, message_text
 
     await interaction.response.send_message("\n".join(response_parts), ephemeral=True)
 
+# ----- /debug_tickets pour vérifier l'état -----
+@tree.command(description="[ADMIN] Vérifier l'état des tickets et nettoyer si nécessaire")
+async def debug_tickets(interaction: discord.Interaction):
+    if not interaction.user.guild_permissions.administrator:
+        return await interaction.response.send_message(
+            "❌ Seuls les administrateurs peuvent utiliser cette commande.", ephemeral=True
+        )
+    
+    guild_id = interaction.guild.id
+    user_id = interaction.user.id
+    
+    # Vérifier les tickets ouverts pour ce serveur
+    open_tickets_for_guild = []
+    for key, ticket_data in open_tickets.items():
+        if ticket_data["guild_id"] == guild_id:
+            channel_id = ticket_data["ticket_channel_id"]
+            channel = interaction.guild.get_channel(channel_id)
+            status = "✅ Existe" if channel else "❌ N'existe plus"
+            open_tickets_for_guild.append(f"- <@{ticket_data['user_id']}>: <#{channel_id}> {status}")
+    
+    # Vérifier si l'utilisateur actuel a un ticket
+    user_ticket = user_has_open_ticket(user_id, guild_id)
+    user_ticket_channel = get_user_open_ticket(user_id, guild_id)
+    
+    embed = discord.Embed(title="🔍 Debug Tickets", color=0x00ff00)
+    embed.add_field(
+        name="📊 Tickets ouverts sur ce serveur", 
+        value="\n".join(open_tickets_for_guild) if open_tickets_for_guild else "Aucun ticket ouvert", 
+        inline=False
+    )
+    embed.add_field(
+        name="👤 Votre statut", 
+        value=f"Ticket ouvert: {'✅ Oui' if user_ticket else '❌ Non'}\nSalon: {f'<#{user_ticket_channel}>' if user_ticket_channel else 'Aucun'}", 
+        inline=False
+    )
+    embed.add_field(
+        name="🧹 Actions", 
+        value="Utilise `/force_clean_tickets` si tu vois des tickets qui n'existent plus", 
+        inline=False
+    )
+    
+    await interaction.response.send_message(embed=embed, ephemeral=True)
+
+# ----- /force_clean_tickets pour forcer le nettoyage -----
+@tree.command(description="[ADMIN] Forcer le nettoyage des tickets inexistants")
+async def force_clean_tickets(interaction: discord.Interaction):
+    if not interaction.user.guild_permissions.administrator:
+        return await interaction.response.send_message(
+            "❌ Seuls les administrateurs peuvent utiliser cette commande.", ephemeral=True
+        )
+    
+    await interaction.response.defer(ephemeral=True)
+    
+    guild_id = interaction.guild.id
+    cleaned_count = 0
+    
+    # Nettoyer les tickets de ce serveur
+    global open_tickets
+    to_remove = []
+    for key, ticket_data in open_tickets.items():
+        if ticket_data["guild_id"] == guild_id:
+            channel_id = ticket_data["ticket_channel_id"]
+            channel = interaction.guild.get_channel(channel_id)
+            if not channel:
+                user_id = ticket_data["user_id"]
+                remove_open_ticket(user_id, guild_id)
+                to_remove.append(key)
+                cleaned_count += 1
+                print(f"Nettoyage forcé: ticket {key} supprimé")
+    
+    for key in to_remove:
+        open_tickets.pop(key, None)
+    
+    await interaction.followup.send(
+        f"🧹 Nettoyage terminé ! **{cleaned_count}** ticket(s) inexistant(s) supprimé(s).", 
+        ephemeral=True
+    )
+
 # ----- Vérification automatique des messages de tickets (toutes les heures) -----
 @tasks.loop(hours=1)
 async def check_ticket_messages():
@@ -536,8 +684,9 @@ async def check_ticket_messages():
             del ticket_messages[guild_id]
 
 # ----- Vérification automatique des tickets ouverts -----
-@tasks.loop(minutes=1)
+@tasks.loop(minutes=2)
 async def check_tickets():
+    """Vérifier toutes les 2 minutes si les tickets ouverts existent encore"""
     global open_tickets
     open_tickets_copy = open_tickets.copy()
     
@@ -547,10 +696,20 @@ async def check_tickets():
         user_id = ticket_data["user_id"]
         
         guild = bot.get_guild(guild_id)
-        if not guild or not guild.get_channel(channel_id):
+        if not guild:
+            # Le serveur n'existe plus ou le bot n'y est plus
             remove_open_ticket(user_id, guild_id)
             del open_tickets[key]
-            print(f"Ticket {key} supprimé du JSON car le salon n'existe plus.")
+            print(f"Ticket {key} supprimé du JSON car le serveur {guild_id} n'est plus accessible.")
+            continue
+            
+        channel = guild.get_channel(channel_id)
+        if not channel:
+            # Le salon n'existe plus
+            remove_open_ticket(user_id, guild_id)
+            del open_tickets[key]
+            print(f"Ticket {key} supprimé du JSON car le salon {channel_id} n'existe plus dans {guild.name}.")
+            continue
 
 # ----- Update status -----
 @tasks.loop(minutes=5)
@@ -658,6 +817,15 @@ async def on_ready():
     check_ticket_messages.start()
     
     print(f"Bot prêt ! Configuré sur {len(ticket_messages)} serveur(s) avec des messages de tickets.")
+    print(f"Tickets ouverts actuellement: {len(open_tickets)}")
+    
+    # Afficher un résumé des serveurs configurés
+    servers_config = load_servers_config()
+    for guild_id, config in servers_config.items():
+        guild = bot.get_guild(int(guild_id))
+        guild_name = guild.name if guild else f"Serveur {guild_id} (inaccessible)"
+        tickets_count = len(ticket_messages.get(int(guild_id), {}))
+        print(f"  - {guild_name}: {tickets_count} message(s) de tickets configuré(s)")
 
 # ----- Lancement du bot -----
 if __name__ == "__main__":
