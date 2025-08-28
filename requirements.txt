@@ -1,5 +1,4 @@
-discord.py
-python-dotenv
-Flask
-psycopg2-binary
-
+discord.py==2.5.1
+Flask==2.3.5
+asyncpg==1.0.0
+python-dotenv==1.0.1
