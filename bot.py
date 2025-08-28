@@ -34,7 +34,6 @@ async def init_database():
                 category_name VARCHAR(255) DEFAULT 'TICKETS',
                 staff_role_id BIGINT,
                 ticket_message TEXT DEFAULT '{user} Merci d''avoir ouvert un ticket. Un membre du staff va te répondre.',
-                status_channel_id BIGINT,
                 created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
             )
         ''')
@@ -70,16 +69,6 @@ async def init_database():
                 created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
             )
         ''')
-        
-        # Table pour le message de status - Correction: une entrée par serveur
-        await conn.execute('''
-            CREATE TABLE IF NOT EXISTS status_messages (
-                guild_id BIGINT PRIMARY KEY,
-                message_id BIGINT,
-                channel_id BIGINT,
-                updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-            )
-        ''')
     
     print("✅ Base de données PostgreSQL initialisée")
 
@@ -95,24 +84,22 @@ async def get_server_config(guild_id: int) -> Dict[str, Any]:
             return {
                 "category_name": row["category_name"],
                 "staff_role_id": row["staff_role_id"],
-                "ticket_message": row["ticket_message"],
-                "status_channel_id": row["status_channel_id"]
+                "ticket_message": row["ticket_message"]
             }
         else:
             # Créer la configuration par défaut
             default_config = {
                 "category_name": "TICKETS",
                 "staff_role_id": None,
-                "ticket_message": "{user} Merci d'avoir ouvert un ticket. Un membre du staff va te répondre.",
-                "status_channel_id": None
+                "ticket_message": "{user} Merci d'avoir ouvert un ticket. Un membre du staff va te répondre."
             }
             
             await conn.execute('''
-                INSERT INTO servers_config (guild_id, category_name, staff_role_id, ticket_message, status_channel_id)
-                VALUES ($1, $2, $3, $4, $5)
+                INSERT INTO servers_config (guild_id, category_name, staff_role_id, ticket_message)
+                VALUES ($1, $2, $3, $4)
                 ON CONFLICT (guild_id) DO NOTHING
             ''', guild_id, default_config["category_name"], default_config["staff_role_id"], 
-                default_config["ticket_message"], default_config["status_channel_id"])
+                default_config["ticket_message"])
             
             return default_config
 
@@ -127,13 +114,13 @@ async def update_server_config(guild_id: int, updates: Dict[str, Any]):
         if not exists:
             # Créer la configuration par défaut
             await conn.execute('''
-                INSERT INTO servers_config (guild_id, category_name, staff_role_id, ticket_message, status_channel_id)
-                VALUES ($1, 'TICKETS', NULL, $2, NULL)
+                INSERT INTO servers_config (guild_id, category_name, staff_role_id, ticket_message)
+                VALUES ($1, 'TICKETS', NULL, $2)
             ''', guild_id, '{user} Merci d\'avoir ouvert un ticket. Un membre du staff va te répondre.')
         
         # Mettre à jour les champs spécifiés
         for key, value in updates.items():
-            if key in ["category_name", "staff_role_id", "ticket_message", "status_channel_id"]:
+            if key in ["category_name", "staff_role_id", "ticket_message"]:
                 await conn.execute(f'''
                     UPDATE servers_config 
                     SET {key} = $1 
@@ -265,45 +252,6 @@ async def remove_close_button_message(message_id: int):
             DELETE FROM close_button_messages WHERE message_id = $1
         ''', message_id)
 
-# ----- Fonctions de gestion du status - CORRIGÉES -----
-async def save_status_message(guild_id: int, message_id: int, channel_id: int):
-    """Sauvegarder l'ID du message de status pour un serveur"""
-    async with db_pool.acquire() as conn:
-        await conn.execute('''
-            INSERT INTO status_messages (guild_id, message_id, channel_id)
-            VALUES ($1, $2, $3)
-            ON CONFLICT (guild_id) 
-            DO UPDATE SET message_id = $2, channel_id = $3, updated_at = CURRENT_TIMESTAMP
-        ''', guild_id, message_id, channel_id)
-
-async def load_status_messages() -> Dict[int, Dict[str, int]]:
-    """Charger tous les messages de status"""
-    async with db_pool.acquire() as conn:
-        rows = await conn.fetch("SELECT * FROM status_messages")
-        
-        result = {}
-        for row in rows:
-            result[row["guild_id"]] = {
-                "message_id": row["message_id"],
-                "channel_id": row["channel_id"]
-            }
-        
-        return result
-
-async def get_status_message(guild_id: int) -> Optional[Dict[str, int]]:
-    """Obtenir le message de status pour un serveur"""
-    async with db_pool.acquire() as conn:
-        row = await conn.fetchrow(
-            "SELECT message_id, channel_id FROM status_messages WHERE guild_id = $1", guild_id
-        )
-        
-        if row:
-            return {
-                "message_id": row["message_id"],
-                "channel_id": row["channel_id"]
-            }
-        return None
-
 # ---------------------------------
 # ----- Bot Discord -----
 intents = discord.Intents.default()
@@ -315,7 +263,6 @@ tree = bot.tree
 ticket_messages = {}
 open_tickets = {}
 close_button_messages = {}
-status_messages = {}
 
 # ----- Fonction de nettoyage immédiat -----
 async def force_clean_guild_tickets(guild_id: int):
@@ -520,10 +467,6 @@ async def help(interaction: discord.Interaction):
 **category_name** (optionnel)
 • Nom de la catégorie pour les tickets
 • Par défaut: `TICKETS`
-
-**status_channel_id** (optionnel)
-• ID du salon pour les messages de statut du bot
-• Le bot y enverra un message toutes les 5 minutes
         """,
         inline=False
     )
@@ -538,7 +481,6 @@ message_text:"Cliquez pour ouvrir un ticket"
 ticket_message:"{user} Merci d'avoir ouvert un ticket !" 
 staff_role_id:987654321098765432
 category_name:"SUPPORT"
-status_channel_id:111222333444555666
 ```
         """,
         inline=False
@@ -557,18 +499,17 @@ status_channel_id:111222333444555666
     embed.set_footer(text="Seuls les administrateurs peuvent utiliser /config")
     
     await interaction.response.send_message(embed=embed, ephemeral=False)
+
 @tree.command(description="[ADMIN] Configurer le système de tickets pour ce serveur")
 @app_commands.describe(
     channel_id="ID du salon où poster le message avec bouton",
     message_text="Texte du message avec bouton",
     ticket_message="Message envoyé dans le ticket (utilise {user} pour mentionner l'utilisateur) - OBLIGATOIRE",
     staff_role_id="ID du rôle staff (optionnel)",
-    category_name="Nom de la catégorie des tickets (optionnel)",
-    status_channel_id="ID du salon pour les messages de status (optionnel)"
+    category_name="Nom de la catégorie des tickets (optionnel)"
 )
 async def config(interaction: discord.Interaction, channel_id: str, message_text: str, 
-                ticket_message: str, staff_role_id: str = None, category_name: str = None,
-                status_channel_id: str = None):
+                ticket_message: str, staff_role_id: str = None, category_name: str = None):
     guild = interaction.guild
     if not guild:
         return await interaction.response.send_message(
@@ -605,18 +546,6 @@ async def config(interaction: discord.Interaction, channel_id: str, message_text
             )
     if category_name:
         updates["category_name"] = category_name
-    if status_channel_id:
-        try:
-            status_chan = guild.get_channel(int(status_channel_id))
-            if not status_chan:
-                return await interaction.response.send_message(
-                    "Salon de status introuvable.", ephemeral=True
-                )
-            updates["status_channel_id"] = int(status_channel_id)
-        except:
-            return await interaction.response.send_message(
-                "ID de salon de status invalide.", ephemeral=True
-            )
     
     if updates:
         await update_server_config(guild.id, updates)
@@ -639,8 +568,6 @@ async def config(interaction: discord.Interaction, channel_id: str, message_text
             response_parts.append(f"✅ Rôle staff configuré : {role.mention}")
     if category_name:
         response_parts.append(f"✅ Catégorie des tickets : `{category_name}`")
-    if status_channel_id:
-        response_parts.append(f"✅ Salon de status configuré : <#{status_channel_id}>")
 
     await interaction.response.send_message("\n".join(response_parts), ephemeral=True)
 
@@ -711,71 +638,6 @@ async def check_tickets():
             del open_tickets[key]
             print(f"Ticket {key} supprimé de la DB car le salon {channel_id} n'existe plus dans {guild.name}.")
             continue
-
-# ----- Update status - CORRIGÉ avec création automatique -----
-@tasks.loop(minutes=5)
-async def update_status():
-    """Mettre à jour les messages de status pour tous les serveurs configurés"""
-    global status_messages
-    
-    # Charger les messages de status depuis la DB
-    status_messages = await load_status_messages()
-    
-    # Vérifier les serveurs qui ont un status_channel_id configuré
-    async with db_pool.acquire() as conn:
-        rows = await conn.fetch('''
-            SELECT guild_id, status_channel_id FROM servers_config 
-            WHERE status_channel_id IS NOT NULL
-        ''')
-        
-        for row in rows:
-            guild_id = row["guild_id"]
-            status_channel_id = row["status_channel_id"]
-            
-            guild = bot.get_guild(guild_id)
-            if not guild:
-                print(f"Serveur {guild_id} non trouvé, ignoré")
-                continue
-                
-            channel = guild.get_channel(status_channel_id)
-            if not channel:
-                print(f"Salon de status {status_channel_id} non trouvé dans {guild.name}")
-                continue
-            
-            current_time = int(discord.utils.utcnow().timestamp())
-            message_updated = False
-            
-            # Vérifier si on a déjà un message de status pour ce serveur
-            if guild_id in status_messages:
-                message_id = status_messages[guild_id]["message_id"]
-                try:
-                    msg = await channel.fetch_message(message_id)
-                    await msg.edit(
-                        content=f"✅ Bot en ligne - Dernière mise à jour: <t:{current_time}:R>"
-                    )
-                    message_updated = True
-                    print(f"Message de status mis à jour pour {guild.name}")
-                except discord.NotFound:
-                    print(f"Message de status {message_id} non trouvé dans {guild.name}, création d'un nouveau")
-                    # Le message n'existe plus, supprimer de la DB et créer un nouveau
-                    status_messages.pop(guild_id, None)
-                except discord.Forbidden:
-                    print(f"Pas de permission pour modifier le message de status dans {guild.name}")
-                    continue
-                except Exception as e:
-                    print(f"Erreur lors de la mise à jour du status pour {guild.name}: {e}")
-            
-            # Si pas de message existant ou si la mise à jour a échoué, créer un nouveau
-            if not message_updated:
-                try:
-                    msg = await channel.send(f"✅ Bot en ligne - <t:{current_time}:R>")
-                    await save_status_message(guild_id, msg.id, channel.id)
-                    status_messages[guild_id] = {"message_id": msg.id, "channel_id": channel.id}
-                    print(f"Nouveau message de status créé pour {guild.name}")
-                except discord.Forbidden:
-                    print(f"Pas de permission pour envoyer un message dans le salon de status de {guild.name}")
-                except Exception as e:
-                    print(f"Erreur lors de la création du message de status pour {guild.name}: {e}")
 
 # ----- on_ready -----
 @bot.event
