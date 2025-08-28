@@ -556,7 +556,7 @@ status_channel_id:111222333444555666
     
     embed.set_footer(text="Seuls les administrateurs peuvent utiliser /config")
     
-    await interaction.response.send_message(embed=embed, ephemeral=True)
+    await interaction.response.send_message(embed=embed, ephemeral=False)
 @tree.command(description="[ADMIN] Configurer le système de tickets pour ce serveur")
 @app_commands.describe(
     channel_id="ID du salon où poster le message avec bouton",
