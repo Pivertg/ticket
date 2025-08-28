@@ -15,119 +15,181 @@ intents.guilds = True
 bot = commands.Bot(command_prefix="!", intents=intents)
 tree = bot.tree
 
-CATEGORY_NAME = os.getenv("TICKETS_CATEGORY", "TICKETS")
-STAFF_ROLE_ID = int(os.getenv("STAFF_ROLE_ID", "1408450110496702545")) if os.getenv("STAFF_ROLE_ID") else 1408450110496702545
-
-# ----- Persistance des messages tickets -----
-TICKET_FILE = "tickets.json"
+# ----- Configuration par serveur -----
+SERVERS_CONFIG_FILE = "servers_config.json"
+TICKET_MESSAGES_FILE = "ticket_messages.json"  # Messages avec boutons par serveur
 OPEN_TICKETS_FILE = "open_tickets.json"
 STATUS_FILE = "status.json"
-TICKET_MESSAGE_FILE = "ticket_message.json"
 CLOSE_BUTTON_FILE = "close_buttons.json"
-STATUS_CHANNEL_ID = 1408498176003932422  # salon status
+
+# Configuration par défaut pour un nouveau serveur
+DEFAULT_CONFIG = {
+    "category_name": "TICKETS",
+    "staff_role_id": None,
+    "ticket_message": "{user} Merci d'avoir ouvert un ticket. Un membre du staff va te répondre.",
+    "status_channel_id": None
+}
+
 status_message_id = None
-custom_ticket_message = None
 
-# ----- Gestion JSON -----
-def save_ticket_message(message_id, channel_id):
+# ----- Gestion JSON Multi-Serveurs -----
+def load_servers_config():
+    """Charger la configuration de tous les serveurs"""
     try:
-        with open(TICKET_FILE, "r") as f:
-            data = json.load(f)
-    except:
-        data = {}
-    data[str(message_id)] = channel_id
-    with open(TICKET_FILE, "w") as f:
-        json.dump(data, f, indent=4)
-
-def load_ticket_messages():
-    try:
-        with open(TICKET_FILE, "r") as f:
-            data = json.load(f)
-        return {int(k): v for k, v in data.items()}
+        with open(SERVERS_CONFIG_FILE, "r", encoding="utf-8") as f:
+            return json.load(f)
     except:
         return {}
 
-def save_open_ticket(user_id, channel_id):
+def save_servers_config(config):
+    """Sauvegarder la configuration de tous les serveurs"""
+    with open(SERVERS_CONFIG_FILE, "w", encoding="utf-8") as f:
+        json.dump(config, f, indent=4, ensure_ascii=False)
+
+def get_server_config(guild_id):
+    """Obtenir la configuration d'un serveur spécifique"""
+    config = load_servers_config()
+    guild_id_str = str(guild_id)
+    if guild_id_str not in config:
+        config[guild_id_str] = DEFAULT_CONFIG.copy()
+        save_servers_config(config)
+    return config[guild_id_str]
+
+def update_server_config(guild_id, updates):
+    """Mettre à jour la configuration d'un serveur"""
+    config = load_servers_config()
+    guild_id_str = str(guild_id)
+    if guild_id_str not in config:
+        config[guild_id_str] = DEFAULT_CONFIG.copy()
+    config[guild_id_str].update(updates)
+    save_servers_config(config)
+
+def load_ticket_messages():
+    """Charger les messages de tickets par serveur"""
+    try:
+        with open(TICKET_MESSAGES_FILE, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        # Convertir les clés en int pour les message_id
+        result = {}
+        for guild_id, messages in data.items():
+            result[int(guild_id)] = {int(msg_id): channel_id for msg_id, channel_id in messages.items()}
+        return result
+    except:
+        return {}
+
+def save_ticket_messages(ticket_messages):
+    """Sauvegarder les messages de tickets par serveur"""
+    # Convertir les clés en string pour JSON
+    data = {}
+    for guild_id, messages in ticket_messages.items():
+        data[str(guild_id)] = {str(msg_id): channel_id for msg_id, channel_id in messages.items()}
+    
+    with open(TICKET_MESSAGES_FILE, "w", encoding="utf-8") as f:
+        json.dump(data, f, indent=4, ensure_ascii=False)
+
+def add_ticket_message(guild_id, message_id, channel_id):
+    """Ajouter un message de ticket pour un serveur"""
+    ticket_messages = load_ticket_messages()
+    if guild_id not in ticket_messages:
+        ticket_messages[guild_id] = {}
+    ticket_messages[guild_id][message_id] = channel_id
+    save_ticket_messages(ticket_messages)
+
+def remove_ticket_message(guild_id, message_id):
+    """Supprimer un message de ticket pour un serveur"""
+    ticket_messages = load_ticket_messages()
+    if guild_id in ticket_messages and message_id in ticket_messages[guild_id]:
+        del ticket_messages[guild_id][message_id]
+        save_ticket_messages(ticket_messages)
+
+def save_open_ticket(user_id, channel_id, guild_id):
     data = {}
     if os.path.exists(OPEN_TICKETS_FILE):
-        with open(OPEN_TICKETS_FILE, "r") as f:
+        with open(OPEN_TICKETS_FILE, "r", encoding="utf-8") as f:
             try:
                 data = json.load(f)
             except:
                 data = {}
-    # ✅ On empêche d'écraser : si l'user existe déjà on ne recrée pas
-    if str(user_id) not in data:
-        data[str(user_id)] = {
+    
+    # Clé unique : user_id + guild_id pour permettre un ticket par serveur
+    key = f"{user_id}_{guild_id}"
+    if key not in data:
+        data[key] = {
+            "user_id": user_id,
+            "guild_id": guild_id,
             "ticket_channel_id": channel_id,
             "created_at": int(time.time())
         }
-    with open(OPEN_TICKETS_FILE, "w") as f:
-        json.dump(data, f, indent=4)
+    with open(OPEN_TICKETS_FILE, "w", encoding="utf-8") as f:
+        json.dump(data, f, indent=4, ensure_ascii=False)
 
-def remove_open_ticket(user_id):
+def remove_open_ticket(user_id, guild_id):
     if not os.path.exists(OPEN_TICKETS_FILE):
         return
-    with open(OPEN_TICKETS_FILE, "r") as f:
+    with open(OPEN_TICKETS_FILE, "r", encoding="utf-8") as f:
         try:
             data = json.load(f)
         except:
             data = {}
-    data.pop(str(user_id), None)
-    with open(OPEN_TICKETS_FILE, "w") as f:
-        json.dump(data, f, indent=4)
+    key = f"{user_id}_{guild_id}"
+    data.pop(key, None)
+    with open(OPEN_TICKETS_FILE, "w", encoding="utf-8") as f:
+        json.dump(data, f, indent=4, ensure_ascii=False)
 
 def load_open_tickets():
     try:
-        with open(OPEN_TICKETS_FILE, "r") as f:
+        with open(OPEN_TICKETS_FILE, "r", encoding="utf-8") as f:
             data = json.load(f)
-        return {int(k): v["ticket_channel_id"] for k, v in data.items()}
+        # Retourner un dict avec clé user_id_guild_id
+        return data
     except:
         return {}
 
-def user_has_open_ticket(user_id):
-    """Vérifier si l'utilisateur a déjà un ticket ouvert"""
+def user_has_open_ticket(user_id, guild_id):
+    """Vérifier si l'utilisateur a déjà un ticket ouvert sur ce serveur"""
     try:
-        with open(OPEN_TICKETS_FILE, "r") as f:
+        with open(OPEN_TICKETS_FILE, "r", encoding="utf-8") as f:
             data = json.load(f)
-        return str(user_id) in data
+        key = f"{user_id}_{guild_id}"
+        return key in data
     except:
         return False
 
+def get_user_open_ticket(user_id, guild_id):
+    """Obtenir le channel ID du ticket ouvert de l'utilisateur sur ce serveur"""
+    try:
+        with open(OPEN_TICKETS_FILE, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        key = f"{user_id}_{guild_id}"
+        if key in data:
+            return data[key]["ticket_channel_id"]
+        return None
+    except:
+        return None
+
 def save_status_message(message_id):
-    with open(STATUS_FILE, "w") as f:
+    with open(STATUS_FILE, "w", encoding="utf-8") as f:
         json.dump({"status_message_id": message_id}, f, indent=4)
 
 def load_status_message():
     try:
-        return json.load(open(STATUS_FILE, "r")).get("status_message_id")
+        return json.load(open(STATUS_FILE, "r", encoding="utf-8")).get("status_message_id")
     except:
         return None
 
-def save_ticket_message_config(message):
-    with open(TICKET_MESSAGE_FILE, "w") as f:
-        json.dump({"ticket_message": message}, f, indent=4)
-
-def load_ticket_message_config():
+def save_close_button_message(message_id, channel_id, guild_id):
     try:
-        with open(TICKET_MESSAGE_FILE, "r") as f:
-            data = json.load(f)
-        return data.get("ticket_message", "{user} Merci d'avoir ouvert un ticket. Un membre du staff va te répondre.")
-    except:
-        return "{user} Merci d'avoir ouvert un ticket. Un membre du staff va te répondre."
-
-def save_close_button_message(message_id, channel_id):
-    try:
-        with open(CLOSE_BUTTON_FILE, "r") as f:
+        with open(CLOSE_BUTTON_FILE, "r", encoding="utf-8") as f:
             data = json.load(f)
     except:
         data = {}
-    data[str(message_id)] = channel_id
-    with open(CLOSE_BUTTON_FILE, "w") as f:
-        json.dump(data, f, indent=4)
+    data[str(message_id)] = {"channel_id": channel_id, "guild_id": guild_id}
+    with open(CLOSE_BUTTON_FILE, "w", encoding="utf-8") as f:
+        json.dump(data, f, indent=4, ensure_ascii=False)
 
 def load_close_button_messages():
     try:
-        with open(CLOSE_BUTTON_FILE, "r") as f:
+        with open(CLOSE_BUTTON_FILE, "r", encoding="utf-8") as f:
             data = json.load(f)
         return {int(k): v for k, v in data.items()}
     except:
@@ -135,17 +197,17 @@ def load_close_button_messages():
 
 def remove_close_button_message(message_id):
     try:
-        with open(CLOSE_BUTTON_FILE, "r") as f:
+        with open(CLOSE_BUTTON_FILE, "r", encoding="utf-8") as f:
             data = json.load(f)
     except:
         return
     data.pop(str(message_id), None)
-    with open(CLOSE_BUTTON_FILE, "w") as f:
-        json.dump(data, f, indent=4)
+    with open(CLOSE_BUTTON_FILE, "w", encoding="utf-8") as f:
+        json.dump(data, f, indent=4, ensure_ascii=False)
 
+# Variables globales
 ticket_messages = load_ticket_messages()
 open_tickets = load_open_tickets()
-custom_ticket_message = load_ticket_message_config()
 close_button_messages = load_close_button_messages()
 
 # ----- Vue bouton ticket -----
@@ -156,19 +218,19 @@ class TicketButton(discord.ui.View):
     @discord.ui.button(label="Ouvrir un ticket", style=discord.ButtonStyle.green)
     async def open_ticket(self, interaction: discord.Interaction, button: discord.ui.Button):
         user_id = interaction.user.id
+        guild_id = interaction.guild.id
         
-        # ✅ Vérifier si l'utilisateur a déjà un ticket ouvert
-        if user_has_open_ticket(user_id):
-            existing_channel_id = open_tickets.get(user_id)
+        # Vérifier si l'utilisateur a déjà un ticket ouvert sur ce serveur
+        if user_has_open_ticket(user_id, guild_id):
+            existing_channel_id = get_user_open_ticket(user_id, guild_id)
             await interaction.response.send_message(
-                f"❌ Tu as déjà un ticket ouvert <#{existing_channel_id}> ! Ferme ton ticket actuel avant d'en créer un nouveau.", 
+                f"❌ Tu as déjà un ticket ouvert <#{existing_channel_id}> sur ce serveur ! Ferme ton ticket actuel avant d'en créer un nouveau.", 
                 ephemeral=True
             )
             return
 
         channel = await create_ticket(interaction.user, interaction.guild)
-        save_open_ticket(user_id, channel.id)
-        open_tickets[user_id] = channel.id
+        save_open_ticket(user_id, channel.id, guild_id)
         await interaction.response.send_message(f"🎫 Ticket créé ! <#{channel.id}>", ephemeral=True)
 
 # ----- Vue bouton fermeture ticket -----
@@ -184,9 +246,13 @@ class CloseTicketButton(discord.ui.View):
                 "Erreur: Impossible d'accéder au serveur.", ephemeral=True
             )
 
+        # Obtenir la configuration du serveur
+        server_config = get_server_config(guild.id)
+        staff_role_id = server_config.get("staff_role_id")
+
         # Vérifier les permissions staff
-        if STAFF_ROLE_ID:
-            role = guild.get_role(STAFF_ROLE_ID)
+        if staff_role_id:
+            role = guild.get_role(staff_role_id)
             member = guild.get_member(interaction.user.id)
             if role and member and role not in member.roles:
                 return await interaction.response.send_message(
@@ -198,21 +264,28 @@ class CloseTicketButton(discord.ui.View):
         )
         await asyncio.sleep(5)
 
-        # ✅ Supprimer de la liste des tickets ouverts
-        for user_id, ch_id in list(open_tickets.items()):
-            if ch_id == interaction.channel.id:
-                remove_open_ticket(user_id)
-                open_tickets.pop(int(user_id), None)
+        # Supprimer de la liste des tickets ouverts
+        global open_tickets
+        to_remove = []
+        for key, ticket_data in open_tickets.items():
+            if ticket_data["ticket_channel_id"] == interaction.channel.id:
+                user_id = ticket_data["user_id"]
+                guild_id = ticket_data["guild_id"]
+                remove_open_ticket(user_id, guild_id)
+                to_remove.append(key)
                 break
+        
+        for key in to_remove:
+            open_tickets.pop(key, None)
 
-        # ✅ Supprimer le message du JSON des boutons de fermeture  
-        for msg_id, ch_id in list(close_button_messages.items()):
-            if ch_id == interaction.channel.id:
+        # Supprimer le message du JSON des boutons de fermeture  
+        for msg_id, data in list(close_button_messages.items()):
+            if data["channel_id"] == interaction.channel.id:
                 remove_close_button_message(msg_id)
                 close_button_messages.pop(int(msg_id), None)
                 break
 
-        # ✅ Vérifier que le channel existe encore avant de le supprimer
+        # Vérifier que le channel existe encore avant de le supprimer
         try:
             await interaction.channel.delete(reason="Ticket fermé par le staff")
         except discord.NotFound:
@@ -222,17 +295,22 @@ class CloseTicketButton(discord.ui.View):
 
 # ----- Création ticket -----
 async def create_ticket(user, guild):
-    category = discord.utils.get(guild.categories, name=CATEGORY_NAME)
+    server_config = get_server_config(guild.id)
+    category_name = server_config.get("category_name", "TICKETS")
+    staff_role_id = server_config.get("staff_role_id")
+    ticket_message = server_config.get("ticket_message", "{user} Merci d'avoir ouvert un ticket. Un membre du staff va te répondre.")
+
+    category = discord.utils.get(guild.categories, name=category_name)
     if category is None:
-        category = await guild.create_category(CATEGORY_NAME, reason="Catégorie tickets")
+        category = await guild.create_category(category_name, reason="Catégorie tickets")
 
     overwrites = {
         guild.default_role: discord.PermissionOverwrite(read_messages=False),
         user: discord.PermissionOverwrite(read_messages=True, send_messages=True)
     }
 
-    if STAFF_ROLE_ID:
-        role = guild.get_role(STAFF_ROLE_ID)
+    if staff_role_id:
+        role = guild.get_role(staff_role_id)
         if role:
             overwrites[role] = discord.PermissionOverwrite(read_messages=True, send_messages=True)
 
@@ -243,13 +321,13 @@ async def create_ticket(user, guild):
         reason="Ticket créé"
     )
 
-    # Utiliser le message personnalisé ou le message par défaut
-    message = custom_ticket_message.replace("{user}", user.mention)
+    # Utiliser le message personnalisé du serveur
+    message = ticket_message.replace("{user}", user.mention)
     msg = await channel.send(message, view=CloseTicketButton())
     
     # Sauvegarder le message avec bouton de fermeture
-    close_button_messages[msg.id] = channel.id
-    save_close_button_message(msg.id, channel.id)
+    close_button_messages[msg.id] = {"channel_id": channel.id, "guild_id": guild.id}
+    save_close_button_message(msg.id, channel.id, guild.id)
     
     return channel
 
@@ -257,12 +335,13 @@ async def create_ticket(user, guild):
 @tree.command(description="Créer un ticket privé avec le staff")
 async def ticket(interaction: discord.Interaction):
     user_id = interaction.user.id
+    guild_id = interaction.guild.id
     
-    # ✅ Vérifier si l'utilisateur a déjà un ticket ouvert
-    if user_has_open_ticket(user_id):
-        existing_channel_id = open_tickets.get(user_id)
+    # Vérifier si l'utilisateur a déjà un ticket ouvert sur ce serveur
+    if user_has_open_ticket(user_id, guild_id):
+        existing_channel_id = get_user_open_ticket(user_id, guild_id)
         await interaction.response.send_message(
-            f"❌ Tu as déjà un ticket ouvert <#{existing_channel_id}> ! Ferme ton ticket actuel avant d'en créer un nouveau.", 
+            f"❌ Tu as déjà un ticket ouvert <#{existing_channel_id}> sur ce serveur ! Ferme ton ticket actuel avant d'en créer un nouveau.", 
             ephemeral=True
         )
         return
@@ -274,8 +353,7 @@ async def ticket(interaction: discord.Interaction):
         )
 
     channel = await create_ticket(interaction.user, guild)
-    save_open_ticket(user_id, channel.id)
-    open_tickets[user_id] = channel.id
+    save_open_ticket(user_id, channel.id, guild_id)
     
     await interaction.response.send_message(
         f"🎫 Ticket créé : <#{channel.id}>", ephemeral=True
@@ -302,8 +380,11 @@ async def close_ticket(interaction: discord.Interaction):
             ephemeral=True
         )
 
-    if STAFF_ROLE_ID:
-        role = guild.get_role(STAFF_ROLE_ID)
+    server_config = get_server_config(guild.id)
+    staff_role_id = server_config.get("staff_role_id")
+
+    if staff_role_id:
+        role = guild.get_role(staff_role_id)
         member = guild.get_member(interaction.user.id)
         if role and member and role not in member.roles:
             return await interaction.response.send_message(
@@ -315,21 +396,28 @@ async def close_ticket(interaction: discord.Interaction):
     )
     await asyncio.sleep(5)
 
-    # ✅ Supprimer de la liste des tickets ouverts
-    for user_id, ch_id in list(open_tickets.items()):
-        if ch_id == interaction.channel.id:
-            remove_open_ticket(user_id)
-            open_tickets.pop(int(user_id), None)
+    # Supprimer de la liste des tickets ouverts
+    global open_tickets
+    to_remove = []
+    for key, ticket_data in open_tickets.items():
+        if ticket_data["ticket_channel_id"] == interaction.channel.id:
+            user_id = ticket_data["user_id"]
+            guild_id = ticket_data["guild_id"]
+            remove_open_ticket(user_id, guild_id)
+            to_remove.append(key)
             break
+    
+    for key in to_remove:
+        open_tickets.pop(key, None)
 
-    # ✅ Supprimer le message du JSON des boutons de fermeture  
-    for msg_id, ch_id in list(close_button_messages.items()):
-        if ch_id == interaction.channel.id:
+    # Supprimer le message du JSON des boutons de fermeture  
+    for msg_id, data in list(close_button_messages.items()):
+        if data["channel_id"] == interaction.channel.id:
             remove_close_button_message(msg_id)
             close_button_messages.pop(int(msg_id), None)
             break
 
-    # ✅ Vérifier que le channel existe encore avant de le supprimer
+    # Vérifier que le channel existe encore avant de le supprimer
     try:
         await interaction.channel.delete(reason="Ticket fermé par le staff")
     except discord.NotFound:
@@ -338,20 +426,23 @@ async def close_ticket(interaction: discord.Interaction):
         print(f"Erreur lors de la suppression du channel: {e}")
 
 # ----- /config avec bouton -----
-@tree.command(description="[ADMIN] Configurer le message ticket")
+@tree.command(description="[ADMIN] Configurer le système de tickets pour ce serveur")
 @app_commands.describe(
-    channel_id="ID du salon où poster le message",
+    channel_id="ID du salon où poster le message avec bouton",
     message_text="Texte du message avec bouton",
-    ticket_message="Message envoyé dans le ticket (utilise {user} pour mentionner l'utilisateur)"
+    ticket_message="Message envoyé dans le ticket (utilise {user} pour mentionner l'utilisateur)",
+    staff_role_id="ID du rôle staff (optionnel)",
+    category_name="Nom de la catégorie des tickets (optionnel)"
 )
-async def config(interaction: discord.Interaction, channel_id: str, message_text: str, ticket_message: str = None):
+async def config(interaction: discord.Interaction, channel_id: str, message_text: str, 
+                ticket_message: str = None, staff_role_id: str = None, category_name: str = None):
     guild = interaction.guild
     if not guild:
         return await interaction.response.send_message(
             "Cette commande doit être utilisée sur le serveur.", ephemeral=True
         )
 
-    # ✅ Vérification permission ADMIN
+    # Vérification permission ADMIN
     if not interaction.user.guild_permissions.administrator:
         return await interaction.response.send_message(
             "❌ Seuls les administrateurs peuvent utiliser cette commande.", ephemeral=True
@@ -368,27 +459,116 @@ async def config(interaction: discord.Interaction, channel_id: str, message_text
             "ID de salon invalide.", ephemeral=True
         )
 
-    msg = await channel.send(message_text, view=TicketButton())
-    ticket_messages[msg.id] = channel.id
-    save_ticket_message(msg.id, channel.id)
-    
-    # Configurer le message de ticket si fourni
-    global custom_ticket_message
+    # Mettre à jour la configuration du serveur
+    updates = {}
     if ticket_message:
-        custom_ticket_message = ticket_message
-        save_ticket_message_config(ticket_message)
-        response_text = f"Message configuré dans {channel.mention} avec bouton 'Ouvrir un ticket'.\n✅ Message d'accueil du ticket configuré : `{ticket_message}`"
-    else:
-        response_text = f"Message configuré dans {channel.mention} avec bouton 'Ouvrir un ticket'."
+        updates["ticket_message"] = ticket_message
+    if staff_role_id:
+        try:
+            updates["staff_role_id"] = int(staff_role_id)
+        except:
+            return await interaction.response.send_message(
+                "ID de rôle staff invalide.", ephemeral=True
+            )
+    if category_name:
+        updates["category_name"] = category_name
+    
+    if updates:
+        update_server_config(guild.id, updates)
 
-    await interaction.response.send_message(response_text, ephemeral=True)
+    # Créer le message avec bouton
+    msg = await channel.send(message_text, view=TicketButton())
+    
+    # Sauvegarder le message de ticket
+    global ticket_messages
+    if guild.id not in ticket_messages:
+        ticket_messages[guild.id] = {}
+    ticket_messages[guild.id][msg.id] = channel.id
+    add_ticket_message(guild.id, msg.id, channel.id)
+    
+    response_parts = [f"✅ Message configuré dans {channel.mention} avec bouton 'Ouvrir un ticket'."]
+    
+    if ticket_message:
+        response_parts.append(f"✅ Message d'accueil du ticket : `{ticket_message}`")
+    if staff_role_id:
+        role = guild.get_role(int(staff_role_id))
+        if role:
+            response_parts.append(f"✅ Rôle staff configuré : {role.mention}")
+    if category_name:
+        response_parts.append(f"✅ Catégorie des tickets : `{category_name}`")
 
+    await interaction.response.send_message("\n".join(response_parts), ephemeral=True)
+
+# ----- Vérification automatique des messages de tickets (toutes les heures) -----
+@tasks.loop(hours=1)
+async def check_ticket_messages():
+    """Vérifier si les messages avec boutons de tickets existent encore"""
+    global ticket_messages
+    ticket_messages_copy = ticket_messages.copy()
+    
+    for guild_id, messages in ticket_messages_copy.items():
+        guild = bot.get_guild(guild_id)
+        if not guild:
+            continue
+            
+        messages_copy = messages.copy()
+        for msg_id, channel_id in messages_copy.items():
+            channel = guild.get_channel(channel_id)
+            if not channel:
+                # Le salon n'existe plus
+                del ticket_messages[guild_id][msg_id]
+                remove_ticket_message(guild_id, msg_id)
+                print(f"Message de ticket {msg_id} supprimé du JSON car le salon {channel_id} n'existe plus dans {guild.name}")
+                continue
+                
+            try:
+                await channel.fetch_message(msg_id)
+            except discord.NotFound:
+                # Le message n'existe plus
+                del ticket_messages[guild_id][msg_id]
+                remove_ticket_message(guild_id, msg_id)
+                print(f"Message de ticket {msg_id} supprimé du JSON car le message n'existe plus dans {guild.name}")
+            except Exception as e:
+                print(f"Erreur lors de la vérification du message {msg_id}: {e}")
+        
+        # Nettoyer les entrées vides
+        if not ticket_messages[guild_id]:
+            del ticket_messages[guild_id]
+
+# ----- Vérification automatique des tickets ouverts -----
+@tasks.loop(minutes=1)
+async def check_tickets():
+    global open_tickets
+    open_tickets_copy = open_tickets.copy()
+    
+    for key, ticket_data in open_tickets_copy.items():
+        channel_id = ticket_data["ticket_channel_id"]
+        guild_id = ticket_data["guild_id"]
+        user_id = ticket_data["user_id"]
+        
+        guild = bot.get_guild(guild_id)
+        if not guild or not guild.get_channel(channel_id):
+            remove_open_ticket(user_id, guild_id)
+            del open_tickets[key]
+            print(f"Ticket {key} supprimé du JSON car le salon n'existe plus.")
 
 # ----- Update status -----
 @tasks.loop(minutes=5)
 async def update_status():
     global status_message_id
-    channel = bot.get_channel(STATUS_CHANNEL_ID)
+    # Utiliser le premier serveur qui a un status_channel_id configuré
+    servers_config = load_servers_config()
+    status_channel_id = None
+    
+    for guild_id, config in servers_config.items():
+        if config.get("status_channel_id"):
+            status_channel_id = config["status_channel_id"]
+            break
+    
+    if not status_channel_id:
+        return
+        
+    channel = bot.get_channel(status_channel_id)
     if not channel:
         return
         
@@ -407,75 +587,77 @@ async def update_status():
             status_message_id = msg.id
             save_status_message(status_message_id)
 
-# ----- Vérification automatique des tickets -----
-@tasks.loop(minutes=1)
-async def check_tickets():
-    global open_tickets
-    to_remove = []
-    for user_id, channel_id in open_tickets.items():
-        found = False
-        for guild in bot.guilds:
-            if guild.get_channel(channel_id):
-                found = True
-                break
-        if not found:
-            to_remove.append(user_id)
-
-    for user_id in to_remove:
-        remove_open_ticket(user_id)
-        open_tickets.pop(int(user_id), None)
-        print(f"Ticket de {user_id} supprimé du JSON car le salon n'existe plus.")
-
 # ----- on_ready -----
 @bot.event
 async def on_ready():
-    global status_message_id, custom_ticket_message
+    global status_message_id, ticket_messages, open_tickets, close_button_messages
     await tree.sync()
     print(f"[Manager] Connecté en tant que {bot.user}")
 
-    # Charger le message de ticket personnalisé
-    custom_ticket_message = load_ticket_message_config()
+    # Recharger toutes les données
+    ticket_messages = load_ticket_messages()
+    open_tickets = load_open_tickets()
+    close_button_messages = load_close_button_messages()
 
-    # Restaurer les boutons des messages de ticket
-    for msg_id, channel_id in ticket_messages.items():
-        channel = bot.get_channel(channel_id)
-        if channel:
-            try:
-                msg = await channel.fetch_message(msg_id)
-                await msg.edit(view=TicketButton())
-            except:
-                pass
+    # Restaurer les boutons des messages de ticket pour tous les serveurs
+    for guild_id, messages in ticket_messages.items():
+        guild = bot.get_guild(guild_id)
+        if not guild:
+            continue
+            
+        for msg_id, channel_id in messages.items():
+            channel = guild.get_channel(channel_id)
+            if channel:
+                try:
+                    msg = await channel.fetch_message(msg_id)
+                    await msg.edit(view=TicketButton())
+                    print(f"Bouton de ticket restauré pour le message {msg_id} dans {guild.name}")
+                except Exception as e:
+                    print(f"Erreur lors de la restauration du bouton de ticket {msg_id} dans {guild.name}: {e}")
     
     # Restaurer les boutons de fermeture des tickets
-    for msg_id, channel_id in close_button_messages.items():
-        channel = bot.get_channel(channel_id)
-        if channel:
-            try:
-                msg = await channel.fetch_message(msg_id)
-                await msg.edit(view=CloseTicketButton())
-            except:
-                pass
+    for msg_id, data in close_button_messages.items():
+        channel_id = data["channel_id"]
+        guild_id = data["guild_id"]
+        guild = bot.get_guild(guild_id)
+        if guild:
+            channel = guild.get_channel(channel_id)
+            if channel:
+                try:
+                    msg = await channel.fetch_message(msg_id)
+                    await msg.edit(view=CloseTicketButton())
+                    print(f"Bouton de fermeture restauré pour le message {msg_id} dans {guild.name}")
+                except Exception as e:
+                    print(f"Erreur lors de la restauration du bouton de fermeture {msg_id}: {e}")
 
     # Gérer le message de status
     status_message_id = load_status_message()
-    channel = bot.get_channel(STATUS_CHANNEL_ID)
-    if channel:
-        if status_message_id:
-            try:
-                msg = await channel.fetch_message(status_message_id)
-                await msg.edit(content="✅ Bot en ligne (redémarré)")
-            except:
-                msg = await channel.send("✅ Bot en ligne")
-                status_message_id = msg.id
-                save_status_message(status_message_id)
-        else:
-            msg = await channel.send("✅ Bot en ligne")
-            status_message_id = msg.id
-            save_status_message(status_message_id)
+    servers_config = load_servers_config()
+    for guild_id, config in servers_config.items():
+        status_channel_id = config.get("status_channel_id")
+        if status_channel_id:
+            channel = bot.get_channel(status_channel_id)
+            if channel:
+                if status_message_id:
+                    try:
+                        msg = await channel.fetch_message(status_message_id)
+                        await msg.edit(content="✅ Bot en ligne (redémarré)")
+                    except:
+                        msg = await channel.send("✅ Bot en ligne")
+                        status_message_id = msg.id
+                        save_status_message(status_message_id)
+                else:
+                    msg = await channel.send("✅ Bot en ligne")
+                    status_message_id = msg.id
+                    save_status_message(status_message_id)
+                break
 
     # Démarrer les tâches
     update_status.start()
     check_tickets.start()
+    check_ticket_messages.start()
+    
+    print(f"Bot prêt ! Configuré sur {len(ticket_messages)} serveur(s) avec des messages de tickets.")
 
 # ----- Lancement du bot -----
 if __name__ == "__main__":
