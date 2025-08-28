@@ -482,18 +482,92 @@ async def create_ticket(user, guild):
     
     return channel
 
-# ----- /config avec bouton ET possibilité de configurer le status -----
+# ----- /help commande -----
+@tree.command(description="Afficher l'aide pour configurer le système de tickets")
+async def help(interaction: discord.Interaction):
+    embed = discord.Embed(
+        title="🎫 Guide de configuration du bot Tickets",
+        description="Voici comment configurer le système de tickets sur votre serveur :",
+        color=0x00ff00
+    )
+    
+    embed.add_field(
+        name="📋 Commande principale",
+        value="`/config`",
+        inline=False
+    )
+    
+    embed.add_field(
+        name="🔧 Paramètres de /config",
+        value="""
+**channel_id** (obligatoire)
+• L'ID du salon où poster le message avec bouton
+• Exemple: `123456789012345678`
+
+**message_text** (obligatoire)  
+• Le texte du message qui contiendra le bouton
+• Exemple: `"Cliquez ici pour ouvrir un ticket"`
+
+**ticket_message** (obligatoire)
+• Message envoyé dans le nouveau ticket
+• Utilisez `{user}` pour mentionner l'utilisateur
+• Exemple: `"{user} Bonjour ! Un staff va vous répondre."`
+
+**staff_role_id** (optionnel)
+• ID du rôle qui peut fermer les tickets
+• Exemple: `987654321098765432`
+
+**category_name** (optionnel)
+• Nom de la catégorie pour les tickets
+• Par défaut: `TICKETS`
+
+**status_channel_id** (optionnel)
+• ID du salon pour les messages de statut du bot
+• Le bot y enverra un message toutes les 5 minutes
+        """,
+        inline=False
+    )
+    
+    embed.add_field(
+        name="💡 Exemple complet",
+        value="""
+```
+/config 
+channel_id:123456789012345678 
+message_text:"Cliquez pour ouvrir un ticket" 
+ticket_message:"{user} Merci d'avoir ouvert un ticket !" 
+staff_role_id:987654321098765432
+category_name:"SUPPORT"
+status_channel_id:111222333444555666
+```
+        """,
+        inline=False
+    )
+    
+    embed.add_field(
+        name="🔍 Comment obtenir les IDs",
+        value="""
+1. Activez le mode développeur Discord
+2. Clic droit sur le salon/rôle → "Copier l'ID"
+3. Collez l'ID dans la commande
+        """,
+        inline=False
+    )
+    
+    embed.set_footer(text="Seuls les administrateurs peuvent utiliser /config")
+    
+    await interaction.response.send_message(embed=embed, ephemeral=True)
 @tree.command(description="[ADMIN] Configurer le système de tickets pour ce serveur")
 @app_commands.describe(
     channel_id="ID du salon où poster le message avec bouton",
     message_text="Texte du message avec bouton",
-    ticket_message="Message envoyé dans le ticket (utilise {user} pour mentionner l'utilisateur)",
+    ticket_message="Message envoyé dans le ticket (utilise {user} pour mentionner l'utilisateur) - OBLIGATOIRE",
     staff_role_id="ID du rôle staff (optionnel)",
     category_name="Nom de la catégorie des tickets (optionnel)",
     status_channel_id="ID du salon pour les messages de status (optionnel)"
 )
 async def config(interaction: discord.Interaction, channel_id: str, message_text: str, 
-                ticket_message: str = None, staff_role_id: str = None, category_name: str = None,
+                ticket_message: str, staff_role_id: str = None, category_name: str = None,
                 status_channel_id: str = None):
     guild = interaction.guild
     if not guild:
@@ -520,8 +594,8 @@ async def config(interaction: discord.Interaction, channel_id: str, message_text
 
     # Mettre à jour la configuration du serveur
     updates = {}
-    if ticket_message:
-        updates["ticket_message"] = ticket_message
+    # Le ticket_message est maintenant obligatoire
+    updates["ticket_message"] = ticket_message
     if staff_role_id:
         try:
             updates["staff_role_id"] = int(staff_role_id)
@@ -558,9 +632,7 @@ async def config(interaction: discord.Interaction, channel_id: str, message_text
     await add_ticket_message(guild.id, msg.id, channel.id)
     
     response_parts = [f"✅ Message configuré dans {channel.mention} avec bouton 'Ouvrir un ticket'."]
-    
-    if ticket_message:
-        response_parts.append(f"✅ Message d'accueil du ticket : `{ticket_message}`")
+    response_parts.append(f"✅ Message d'accueil du ticket : `{ticket_message}`")
     if staff_role_id:
         role = guild.get_role(int(staff_role_id))
         if role:
@@ -640,7 +712,7 @@ async def check_tickets():
             print(f"Ticket {key} supprimé de la DB car le salon {channel_id} n'existe plus dans {guild.name}.")
             continue
 
-# ----- Update status - CORRIGÉ -----
+# ----- Update status - CORRIGÉ avec création automatique -----
 @tasks.loop(minutes=5)
 async def update_status():
     """Mettre à jour les messages de status pour tous les serveurs configurés"""
@@ -662,13 +734,16 @@ async def update_status():
             
             guild = bot.get_guild(guild_id)
             if not guild:
+                print(f"Serveur {guild_id} non trouvé, ignoré")
                 continue
                 
             channel = guild.get_channel(status_channel_id)
             if not channel:
+                print(f"Salon de status {status_channel_id} non trouvé dans {guild.name}")
                 continue
             
             current_time = int(discord.utils.utcnow().timestamp())
+            message_updated = False
             
             # Vérifier si on a déjà un message de status pour ce serveur
             if guild_id in status_messages:
@@ -678,22 +753,27 @@ async def update_status():
                     await msg.edit(
                         content=f"✅ Bot en ligne - Dernière mise à jour: <t:{current_time}:R>"
                     )
+                    message_updated = True
                     print(f"Message de status mis à jour pour {guild.name}")
                 except discord.NotFound:
-                    # Le message n'existe plus, en créer un nouveau
-                    msg = await channel.send(f"✅ Bot en ligne - <t:{current_time}:R>")
-                    await save_status_message(guild_id, msg.id, channel.id)
-                    status_messages[guild_id] = {"message_id": msg.id, "channel_id": channel.id}
-                    print(f"Nouveau message de status créé pour {guild.name}")
+                    print(f"Message de status {message_id} non trouvé dans {guild.name}, création d'un nouveau")
+                    # Le message n'existe plus, supprimer de la DB et créer un nouveau
+                    status_messages.pop(guild_id, None)
+                except discord.Forbidden:
+                    print(f"Pas de permission pour modifier le message de status dans {guild.name}")
+                    continue
                 except Exception as e:
                     print(f"Erreur lors de la mise à jour du status pour {guild.name}: {e}")
-            else:
-                # Pas de message de status existant, en créer un nouveau
+            
+            # Si pas de message existant ou si la mise à jour a échoué, créer un nouveau
+            if not message_updated:
                 try:
                     msg = await channel.send(f"✅ Bot en ligne - <t:{current_time}:R>")
                     await save_status_message(guild_id, msg.id, channel.id)
                     status_messages[guild_id] = {"message_id": msg.id, "channel_id": channel.id}
-                    print(f"Premier message de status créé pour {guild.name}")
+                    print(f"Nouveau message de status créé pour {guild.name}")
+                except discord.Forbidden:
+                    print(f"Pas de permission pour envoyer un message dans le salon de status de {guild.name}")
                 except Exception as e:
                     print(f"Erreur lors de la création du message de status pour {guild.name}: {e}")
 
@@ -755,16 +835,20 @@ async def on_ready():
         current_time = int(discord.utils.utcnow().timestamp())
         
         for row in rows:
-            guild_id = row["status_channel_id"] 
+            guild_id = row["guild_id"]
             status_channel_id = row["status_channel_id"]
             
             guild = bot.get_guild(guild_id)
             if not guild:
+                print(f"Serveur {guild_id} non accessible au démarrage")
                 continue
                 
             channel = guild.get_channel(status_channel_id)
             if not channel:
+                print(f"Salon de status {status_channel_id} non trouvé dans {guild.name}")
                 continue
+            
+            message_created = False
             
             # Vérifier si on a déjà un message de status en DB
             if guild_id in status_messages:
@@ -772,22 +856,24 @@ async def on_ready():
                 try:
                     msg = await channel.fetch_message(message_id)
                     await msg.edit(content=f"✅ Bot en ligne (redémarré) - <t:{current_time}:R>")
+                    message_created = True
                     print(f"Message de status restauré pour {guild.name}")
                 except discord.NotFound:
-                    # Le message n'existe plus, en créer un nouveau
-                    msg = await channel.send(f"✅ Bot en ligne (redémarré) - <t:{current_time}:R>")
-                    await save_status_message(guild_id, msg.id, channel.id)
-                    status_messages[guild_id] = {"message_id": msg.id, "channel_id": channel.id}
-                    print(f"Nouveau message de status créé pour {guild.name}")
+                    print(f"Message de status {message_id} non trouvé dans {guild.name}, création d'un nouveau")
+                    # Le message n'existe plus, supprimer de la mémoire
+                    status_messages.pop(guild_id, None)
                 except Exception as e:
                     print(f"Erreur lors de la restauration du status pour {guild.name}: {e}")
-            else:
-                # Pas de message de status existant, en créer un nouveau
+            
+            # Si aucun message existant ou restauration échouée, créer un nouveau
+            if not message_created:
                 try:
                     msg = await channel.send(f"✅ Bot en ligne (redémarré) - <t:{current_time}:R>")
                     await save_status_message(guild_id, msg.id, channel.id)
                     status_messages[guild_id] = {"message_id": msg.id, "channel_id": channel.id}
-                    print(f"Premier message de status créé pour {guild.name}")
+                    print(f"Nouveau message de status créé au démarrage pour {guild.name}")
+                except discord.Forbidden:
+                    print(f"Pas de permission pour envoyer un message dans le salon de status de {guild.name}")
                 except Exception as e:
                     print(f"Erreur lors de la création du message de status pour {guild.name}: {e}")
 
