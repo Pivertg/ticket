@@ -34,6 +34,7 @@ async def init_database():
                 category_name VARCHAR(255) DEFAULT 'TICKETS',
                 staff_role_id BIGINT,
                 ticket_message TEXT DEFAULT '{user} Merci d''avoir ouvert un ticket. Un membre du staff va te répondre.',
+                status_channel_id BIGINT,
                 created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
             )
         ''')
@@ -69,6 +70,16 @@ async def init_database():
                 created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
             )
         ''')
+        
+        # Table pour les messages de status
+        await conn.execute('''
+            CREATE TABLE IF NOT EXISTS status_messages (
+                guild_id BIGINT PRIMARY KEY,
+                message_id BIGINT,
+                channel_id BIGINT,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )
+        ''')
     
     print("✅ Base de données PostgreSQL initialisée")
 
@@ -84,22 +95,24 @@ async def get_server_config(guild_id: int) -> Dict[str, Any]:
             return {
                 "category_name": row["category_name"],
                 "staff_role_id": row["staff_role_id"],
-                "ticket_message": row["ticket_message"]
+                "ticket_message": row["ticket_message"],
+                "status_channel_id": row["status_channel_id"]
             }
         else:
             # Créer la configuration par défaut
             default_config = {
                 "category_name": "TICKETS",
                 "staff_role_id": None,
-                "ticket_message": "{user} Merci d'avoir ouvert un ticket. Un membre du staff va te répondre."
+                "ticket_message": "{user} Merci d'avoir ouvert un ticket. Un membre du staff va te répondre.",
+                "status_channel_id": None
             }
             
             await conn.execute('''
-                INSERT INTO servers_config (guild_id, category_name, staff_role_id, ticket_message)
-                VALUES ($1, $2, $3, $4)
+                INSERT INTO servers_config (guild_id, category_name, staff_role_id, ticket_message, status_channel_id)
+                VALUES ($1, $2, $3, $4, $5)
                 ON CONFLICT (guild_id) DO NOTHING
             ''', guild_id, default_config["category_name"], default_config["staff_role_id"], 
-                default_config["ticket_message"])
+                default_config["ticket_message"], default_config["status_channel_id"])
             
             return default_config
 
@@ -114,13 +127,13 @@ async def update_server_config(guild_id: int, updates: Dict[str, Any]):
         if not exists:
             # Créer la configuration par défaut
             await conn.execute('''
-                INSERT INTO servers_config (guild_id, category_name, staff_role_id, ticket_message)
-                VALUES ($1, 'TICKETS', NULL, $2)
+                INSERT INTO servers_config (guild_id, category_name, staff_role_id, ticket_message, status_channel_id)
+                VALUES ($1, 'TICKETS', NULL, $2, NULL)
             ''', guild_id, '{user} Merci d\'avoir ouvert un ticket. Un membre du staff va te répondre.')
         
         # Mettre à jour les champs spécifiés
         for key, value in updates.items():
-            if key in ["category_name", "staff_role_id", "ticket_message"]:
+            if key in ["category_name", "staff_role_id", "ticket_message", "status_channel_id"]:
                 await conn.execute(f'''
                     UPDATE servers_config 
                     SET {key} = $1 
@@ -252,6 +265,38 @@ async def remove_close_button_message(message_id: int):
             DELETE FROM close_button_messages WHERE message_id = $1
         ''', message_id)
 
+# ----- Fonctions de gestion des messages de status -----
+async def save_status_message(guild_id: int, message_id: int, channel_id: int):
+    """Sauvegarder un message de status"""
+    async with db_pool.acquire() as conn:
+        await conn.execute('''
+            INSERT INTO status_messages (guild_id, message_id, channel_id)
+            VALUES ($1, $2, $3)
+            ON CONFLICT (guild_id) 
+            DO UPDATE SET message_id = $2, channel_id = $3
+        ''', guild_id, message_id, channel_id)
+
+async def load_status_messages() -> Dict[int, Dict[str, int]]:
+    """Charger tous les messages de status"""
+    async with db_pool.acquire() as conn:
+        rows = await conn.fetch("SELECT * FROM status_messages")
+        
+        result = {}
+        for row in rows:
+            result[row["guild_id"]] = {
+                "message_id": row["message_id"],
+                "channel_id": row["channel_id"]
+            }
+        
+        return result
+
+async def remove_status_message(guild_id: int):
+    """Supprimer un message de status"""
+    async with db_pool.acquire() as conn:
+        await conn.execute('''
+            DELETE FROM status_messages WHERE guild_id = $1
+        ''', guild_id)
+
 # ---------------------------------
 # ----- Bot Discord -----
 intents = discord.Intents.default()
@@ -263,6 +308,7 @@ tree = bot.tree
 ticket_messages = {}
 open_tickets = {}
 close_button_messages = {}
+status_messages = {}
 
 # ----- Fonction de nettoyage immédiat -----
 async def force_clean_guild_tickets(guild_id: int):
@@ -428,6 +474,33 @@ async def create_ticket(user, guild):
     await save_close_button_message(msg.id, channel.id, guild.id)
     
     return channel
+
+# ----- Tâche de mise à jour du status -----
+@tasks.loop(minutes=5)
+async def update_status():
+    """Met à jour les messages de status toutes les 5 minutes"""
+    global status_messages
+    current_time = int(discord.utils.utcnow().timestamp())
+    
+    for guild_id, data in status_messages.items():
+        guild = bot.get_guild(guild_id)
+        if not guild:
+            continue
+            
+        channel = guild.get_channel(data["channel_id"])
+        if not channel:
+            continue
+            
+        try:
+            msg = await channel.fetch_message(data["message_id"])
+            await msg.edit(content=f"✅ Bot en ligne - <t:{current_time}:R>")
+        except discord.NotFound:
+            # Le message n'existe plus, le supprimer de la mémoire
+            await remove_status_message(guild_id)
+            status_messages.pop(guild_id, None)
+            print(f"Message de status supprimé pour {guild.name} (message introuvable)")
+        except Exception as e:
+            print(f"Erreur lors de la mise à jour du status pour {guild.name}: {e}")
 
 # ----- /help commande -----
 @tree.command(description="Afficher l'aide pour configurer le système de tickets")
