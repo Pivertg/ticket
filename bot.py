@@ -1,805 +1,993 @@
-import os
 import discord
-from discord import app_commands
 from discord.ext import commands, tasks
-import asyncio
+import redis
 import json
-import time
-import asyncpg
-from typing import Optional, Dict, Any
-
-# ---------------------------------
-# ----- Configuration PostgreSQL -----
-DATABASE_URL = os.getenv("DATABASE_URL")
-
-# Pool de connexions PostgreSQL
-db_pool = None
-
-async def init_database():
-    """Initialiser la base de données PostgreSQL et créer les tables"""
-    global db_pool
-    
-    if not DATABASE_URL:
-        raise ValueError("❌ DATABASE_URL manquant dans les variables d'environnement")
-    
-    # Créer le pool de connexions
-    db_pool = await asyncpg.create_pool(DATABASE_URL, min_size=1, max_size=10)
-    
-    # Créer les tables si elles n'existent pas
-    async with db_pool.acquire() as conn:
-        # Table pour la configuration des serveurs
-        await conn.execute('''
-            CREATE TABLE IF NOT EXISTS servers_config (
-                guild_id BIGINT PRIMARY KEY,
-                category_name VARCHAR(255) DEFAULT 'TICKETS',
-                staff_role_id BIGINT,
-                ticket_message TEXT DEFAULT '{user} Merci d''avoir ouvert un ticket. Un membre du staff va te répondre.',
-                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-            )
-        ''')
-        
-        # Table pour les messages avec boutons de tickets
-        await conn.execute('''
-            CREATE TABLE IF NOT EXISTS ticket_messages (
-                message_id BIGINT,
-                guild_id BIGINT,
-                channel_id BIGINT,
-                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                PRIMARY KEY (message_id, guild_id)
-            )
-        ''')
-        
-        # Table pour les tickets ouverts
-        await conn.execute('''
-            CREATE TABLE IF NOT EXISTS open_tickets (
-                user_id BIGINT,
-                guild_id BIGINT,
-                ticket_channel_id BIGINT,
-                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                PRIMARY KEY (user_id, guild_id)
-            )
-        ''')
-        
-        # Table pour les messages de fermeture
-        await conn.execute('''
-            CREATE TABLE IF NOT EXISTS close_button_messages (
-                message_id BIGINT PRIMARY KEY,
-                channel_id BIGINT,
-                guild_id BIGINT,
-                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-            )
-        ''')
-    
-    print("✅ Base de données PostgreSQL initialisée")
-
-# ----- Fonctions de gestion de la configuration des serveurs -----
-async def get_server_config(guild_id: int) -> Dict[str, Any]:
-    """Obtenir la configuration d'un serveur spécifique"""
-    async with db_pool.acquire() as conn:
-        row = await conn.fetchrow(
-            "SELECT * FROM servers_config WHERE guild_id = $1", guild_id
-        )
-        
-        if row:
-            return {
-                "category_name": row["category_name"],
-                "staff_role_id": row["staff_role_id"],
-                "ticket_message": row["ticket_message"]
-            }
-        else:
-            # Créer la configuration par défaut
-            default_config = {
-                "category_name": "TICKETS",
-                "staff_role_id": None,
-                "ticket_message": "{user} Merci d'avoir ouvert un ticket. Un membre du staff va te répondre."
-            }
-            
-            await conn.execute('''
-                INSERT INTO servers_config (guild_id, category_name, staff_role_id, ticket_message)
-                VALUES ($1, $2, $3, $4)
-                ON CONFLICT (guild_id) DO NOTHING
-            ''', guild_id, default_config["category_name"], default_config["staff_role_id"], 
-                default_config["ticket_message"])
-            
-            return default_config
-
-async def update_server_config(guild_id: int, updates: Dict[str, Any]):
-    """Mettre à jour la configuration d'un serveur"""
-    async with db_pool.acquire() as conn:
-        # Vérifier si la configuration existe
-        exists = await conn.fetchval(
-            "SELECT EXISTS(SELECT 1 FROM servers_config WHERE guild_id = $1)", guild_id
-        )
-        
-        if not exists:
-            # Créer la configuration par défaut
-            await conn.execute('''
-                INSERT INTO servers_config (guild_id, category_name, staff_role_id, ticket_message)
-                VALUES ($1, 'TICKETS', NULL, $2)
-            ''', guild_id, '{user} Merci d\'avoir ouvert un ticket. Un membre du staff va te répondre.')
-        
-        # Mettre à jour les champs spécifiés
-        for key, value in updates.items():
-            if key in ["category_name", "staff_role_id", "ticket_message"]:
-                await conn.execute(f'''
-                    UPDATE servers_config 
-                    SET {key} = $1 
-                    WHERE guild_id = $2
-                ''', value, guild_id)
-
-# ----- Fonctions de gestion des messages de tickets -----
-async def add_ticket_message(guild_id: int, message_id: int, channel_id: int):
-    """Ajouter un message de ticket pour un serveur"""
-    async with db_pool.acquire() as conn:
-        await conn.execute('''
-            INSERT INTO ticket_messages (message_id, guild_id, channel_id)
-            VALUES ($1, $2, $3)
-            ON CONFLICT (message_id, guild_id) DO UPDATE SET channel_id = $3
-        ''', message_id, guild_id, channel_id)
-
-async def remove_ticket_message(guild_id: int, message_id: int):
-    """Supprimer un message de ticket pour un serveur"""
-    async with db_pool.acquire() as conn:
-        await conn.execute('''
-            DELETE FROM ticket_messages 
-            WHERE guild_id = $1 AND message_id = $2
-        ''', guild_id, message_id)
-
-async def load_ticket_messages() -> Dict[int, Dict[int, int]]:
-    """Charger tous les messages de tickets"""
-    async with db_pool.acquire() as conn:
-        rows = await conn.fetch("SELECT * FROM ticket_messages")
-        
-        result = {}
-        for row in rows:
-            guild_id = row["guild_id"]
-            message_id = row["message_id"]
-            channel_id = row["channel_id"]
-            
-            if guild_id not in result:
-                result[guild_id] = {}
-            result[guild_id][message_id] = channel_id
-        
-        return result
-
-# ----- Fonctions de gestion des tickets ouverts -----
-async def save_open_ticket(user_id: int, channel_id: int, guild_id: int):
-    """Sauvegarder un ticket ouvert"""
-    async with db_pool.acquire() as conn:
-        await conn.execute('''
-            INSERT INTO open_tickets (user_id, guild_id, ticket_channel_id)
-            VALUES ($1, $2, $3)
-            ON CONFLICT (user_id, guild_id) 
-            DO UPDATE SET ticket_channel_id = $3, created_at = CURRENT_TIMESTAMP
-        ''', user_id, guild_id, channel_id)
-    
-    print(f"Ticket sauvegardé: utilisateur {user_id} sur serveur {guild_id} -> salon {channel_id}")
-
-async def remove_open_ticket(user_id: int, guild_id: int):
-    """Supprimer un ticket ouvert"""
-    async with db_pool.acquire() as conn:
-        result = await conn.execute('''
-            DELETE FROM open_tickets 
-            WHERE user_id = $1 AND guild_id = $2
-        ''', user_id, guild_id)
-        
-        if result == "DELETE 1":
-            print(f"Ticket supprimé de la DB: utilisateur {user_id} sur serveur {guild_id}")
-        else:
-            print(f"Ticket non trouvé dans la DB: utilisateur {user_id} sur serveur {guild_id}")
-
-async def user_has_open_ticket(user_id: int, guild_id: int) -> bool:
-    """Vérifier si l'utilisateur a déjà un ticket ouvert sur ce serveur"""
-    async with db_pool.acquire() as conn:
-        return await conn.fetchval('''
-            SELECT EXISTS(SELECT 1 FROM open_tickets WHERE user_id = $1 AND guild_id = $2)
-        ''', user_id, guild_id)
-
-async def get_user_open_ticket(user_id: int, guild_id: int) -> Optional[int]:
-    """Obtenir le channel ID du ticket ouvert de l'utilisateur sur ce serveur"""
-    async with db_pool.acquire() as conn:
-        return await conn.fetchval('''
-            SELECT ticket_channel_id FROM open_tickets 
-            WHERE user_id = $1 AND guild_id = $2
-        ''', user_id, guild_id)
-
-async def load_open_tickets() -> Dict[str, Dict[str, Any]]:
-    """Charger tous les tickets ouverts"""
-    async with db_pool.acquire() as conn:
-        rows = await conn.fetch("SELECT * FROM open_tickets")
-        
-        result = {}
-        for row in rows:
-            key = f"{row['user_id']}_{row['guild_id']}"
-            result[key] = {
-                "user_id": row["user_id"],
-                "guild_id": row["guild_id"],
-                "ticket_channel_id": row["ticket_channel_id"],
-                "created_at": int(row["created_at"].timestamp())
-            }
-        
-        return result
-
-# ----- Fonctions de gestion des boutons de fermeture -----
-async def save_close_button_message(message_id: int, channel_id: int, guild_id: int):
-    """Sauvegarder un message avec bouton de fermeture"""
-    async with db_pool.acquire() as conn:
-        await conn.execute('''
-            INSERT INTO close_button_messages (message_id, channel_id, guild_id)
-            VALUES ($1, $2, $3)
-            ON CONFLICT (message_id) 
-            DO UPDATE SET channel_id = $2, guild_id = $3
-        ''', message_id, channel_id, guild_id)
-
-async def load_close_button_messages() -> Dict[int, Dict[str, int]]:
-    """Charger tous les messages avec boutons de fermeture"""
-    async with db_pool.acquire() as conn:
-        rows = await conn.fetch("SELECT * FROM close_button_messages")
-        
-        result = {}
-        for row in rows:
-            result[row["message_id"]] = {
-                "channel_id": row["channel_id"],
-                "guild_id": row["guild_id"]
-            }
-        
-        return result
-
-async def remove_close_button_message(message_id: int):
-    """Supprimer un message avec bouton de fermeture"""
-    async with db_pool.acquire() as conn:
-        await conn.execute('''
-            DELETE FROM close_button_messages WHERE message_id = $1
-        ''', message_id)
-
-# ---------------------------------
-# ----- Bot Discord -----
-intents = discord.Intents.default()
-intents.guilds = True
-bot = commands.Bot(command_prefix="!", intents=intents)
-tree = bot.tree
-
-# Variables globales
-ticket_messages = {}
-open_tickets = {}
-close_button_messages = {}
-
-# ----- Fonction de nettoyage immédiat -----
-async def force_clean_guild_tickets(guild_id: int):
-    """Nettoyer immédiatement les tickets inexistants pour un serveur"""
-    global open_tickets
-    guild = bot.get_guild(guild_id)
-    if not guild:
-        return
-    
-    to_remove = []
-    async with db_pool.acquire() as conn:
-        rows = await conn.fetch("SELECT * FROM open_tickets WHERE guild_id = $1", guild_id)
-        
-        for row in rows:
-            channel_id = row["ticket_channel_id"]
-            user_id = row["user_id"]
-            channel = guild.get_channel(channel_id)
-            
-            if not channel:
-                await remove_open_ticket(user_id, guild_id)
-                key = f"{user_id}_{guild_id}"
-                to_remove.append(key)
-                print(f"Nettoyage immédiat: ticket {key} supprimé")
-    
-    for key in to_remove:
-        open_tickets.pop(key, None)
-    
-    print(f"Nettoyage immédiat terminé pour le serveur {guild.name}: {len(to_remove)} ticket(s) nettoyé(s)")
-
-# ----- Vue bouton ticket -----
-class TicketButton(discord.ui.View):
-    def __init__(self):
-        super().__init__(timeout=None)
-
-    @discord.ui.button(label="Ouvrir un ticket", style=discord.ButtonStyle.green)
-    async def open_ticket(self, interaction: discord.Interaction, button: discord.ui.Button):
-        user_id = interaction.user.id
-        guild_id = interaction.guild.id
-        
-        # Vérifier si l'utilisateur a déjà un ticket ouvert sur ce serveur
-        if await user_has_open_ticket(user_id, guild_id):
-            existing_channel_id = await get_user_open_ticket(user_id, guild_id)
-            print(f"Tentative d'ouverture de ticket bloquée: utilisateur {user_id} a déjà le ticket {existing_channel_id} sur serveur {guild_id}")
-            await interaction.response.send_message(
-                f"❌ Tu as déjà un ticket ouvert <#{existing_channel_id}> sur ce serveur ! Ferme ton ticket actuel avant d'en créer un nouveau.", 
-                ephemeral=True
-            )
-            return
-
-        print(f"Création de ticket autorisée pour utilisateur {user_id} sur serveur {guild_id}")
-        channel = await create_ticket(interaction.user, interaction.guild)
-        await save_open_ticket(user_id, channel.id, guild_id)
-        print(f"Ticket créé avec succès: salon {channel.id} pour utilisateur {user_id}")
-        await interaction.response.send_message(f"🎫 Ticket créé ! <#{channel.id}>", ephemeral=True)
-
-# ----- Vue bouton fermeture ticket -----
-class CloseTicketButton(discord.ui.View):
-    def __init__(self):
-        super().__init__(timeout=None)
-
-    @discord.ui.button(label="🗑️ Fermer le ticket", style=discord.ButtonStyle.red)
-    async def close_ticket_button(self, interaction: discord.Interaction, button: discord.ui.Button):
-        guild = interaction.guild
-        if not guild:
-            return await interaction.response.send_message(
-                "Erreur: Impossible d'accéder au serveur.", ephemeral=True
-            )
-
-        # Obtenir la configuration du serveur
-        server_config = await get_server_config(guild.id)
-        staff_role_id = server_config.get("staff_role_id")
-
-        # Vérifier les permissions staff
-        if staff_role_id:
-            role = guild.get_role(staff_role_id)
-            member = guild.get_member(interaction.user.id)
-            if role and member and role not in member.roles:
-                return await interaction.response.send_message(
-                    "❌ Seul le staff peut fermer les tickets.", ephemeral=True
-                )
-
-        await interaction.response.send_message(
-            "🗑️ Fermeture du ticket dans 5 secondes..."
-        )
-        
-        # Sauvegarder les IDs avant suppression
-        channel_id_to_remove = interaction.channel.id
-        guild_id_to_clean = interaction.guild.id
-        
-        await asyncio.sleep(5)
-
-        # Supprimer de la liste des tickets ouverts
-        global open_tickets
-        async with db_pool.acquire() as conn:
-            row = await conn.fetchrow('''
-                SELECT user_id, guild_id FROM open_tickets 
-                WHERE ticket_channel_id = $1
-            ''', channel_id_to_remove)
-            
-            if row:
-                user_id = row["user_id"]
-                guild_id = row["guild_id"]
-                await remove_open_ticket(user_id, guild_id)
-                key = f"{user_id}_{guild_id}"
-                open_tickets.pop(key, None)
-                print(f"Ticket fermé: utilisateur {user_id} sur serveur {guild_id}")
-
-        # Supprimer le message du JSON des boutons de fermeture  
-        for msg_id, data in list(close_button_messages.items()):
-            if data["channel_id"] == channel_id_to_remove:
-                await remove_close_button_message(msg_id)
-                close_button_messages.pop(int(msg_id), None)
-                print(f"Bouton de fermeture supprimé pour le message {msg_id}")
-                break
-
-        # Vérifier que le channel existe encore avant de le supprimer
-        try:
-            channel_to_delete = bot.get_channel(channel_id_to_remove)
-            if channel_to_delete:
-                await channel_to_delete.delete(reason="Ticket fermé par le staff")
-                print(f"Salon {channel_id_to_remove} supprimé avec succès")
-            else:
-                print(f"Salon {channel_id_to_remove} déjà supprimé ou introuvable")
-        except discord.NotFound:
-            print(f"Channel {channel_id_to_remove} déjà supprimé")
-        except Exception as e:
-            print(f"Erreur lors de la suppression du channel: {e}")
-
-# ----- Création ticket -----
-async def create_ticket(user, guild):
-    server_config = await get_server_config(guild.id)
-    category_name = server_config.get("category_name", "TICKETS")
-    staff_role_id = server_config.get("staff_role_id")
-    ticket_message = server_config.get("ticket_message", "{user} Merci d'avoir ouvert un ticket. Un membre du staff va te répondre.")
-
-    category = discord.utils.get(guild.categories, name=category_name)
-    if category is None:
-        category = await guild.create_category(category_name, reason="Catégorie tickets")
-
-    overwrites = {
-        guild.default_role: discord.PermissionOverwrite(read_messages=False),
-        user: discord.PermissionOverwrite(read_messages=True, send_messages=True)
-    }
-
-    if staff_role_id:
-        role = guild.get_role(staff_role_id)
-        if role:
-            overwrites[role] = discord.PermissionOverwrite(read_messages=True, send_messages=True)
-
-    channel = await guild.create_text_channel(
-        name=f"ticket-{user.name}",
-        category=category,
-        overwrites=overwrites,
-        reason="Ticket créé"
-    )
-
-    # Utiliser le message personnalisé du serveur
-    message = ticket_message.replace("{user}", user.mention)
-    msg = await channel.send(message, view=CloseTicketButton())
-    
-    # Sauvegarder le message avec bouton de fermeture
-    close_button_messages[msg.id] = {"channel_id": channel.id, "guild_id": guild.id}
-    await save_close_button_message(msg.id, channel.id, guild.id)
-    
-    return channel
-
-# ----- /help commande -----
-@tree.command(description="Afficher l'aide pour configurer le système de tickets")
-async def help(interaction: discord.Interaction):
-    embed = discord.Embed(
-        title="🎫 Guide de configuration du bot Tickets",
-        description="Voici comment configurer le système de tickets sur votre serveur :",
-        color=0x00ff00
-    )
-    
-    embed.add_field(
-        name="📋 Commande principale",
-        value="`/config`",
-        inline=False
-    )
-    
-    embed.add_field(
-        name="🔧 Paramètres de /config",
-        value="""
-**channel_id** (obligatoire)
-• L'ID du salon où poster le message avec bouton
-• Exemple: `123456789012345678`
-
-**message_text** (obligatoire)  
-• Le texte du message qui contiendra le bouton
-• Exemple: `"Cliquez ici pour ouvrir un ticket"`
-
-**ticket_message** (obligatoire)
-• Message envoyé dans le nouveau ticket
-• Utilisez `{user}` pour mentionner l'utilisateur
-• Exemple: `"{user} Bonjour ! Un staff va vous répondre."`
-
-**staff_role_id** (optionnel)
-• ID du rôle qui peut fermer les tickets
-• Exemple: `987654321098765432`
-
-**category_name** (optionnel)
-• Nom de la catégorie pour les tickets
-• Par défaut: `TICKETS`
-        """,
-        inline=False
-    )
-    
-    embed.add_field(
-        name="💡 Exemple complet",
-        value="""
-```
-/config 
-channel_id:123456789012345678 
-message_text:"Cliquez pour ouvrir un ticket" 
-ticket_message:"{user} Merci d'avoir ouvert un ticket !" 
-staff_role_id:987654321098765432
-category_name:"SUPPORT"
-```
-        """,
-        inline=False
-    )
-    
-    embed.add_field(
-        name="🔍 Comment obtenir les IDs",
-        value="""
-1. Activez le mode développeur Discord
-2. Clic droit sur le salon/rôle → "Copier l'ID"
-3. Collez l'ID dans la commande
-        """,
-        inline=False
-    )
-    
-    embed.set_footer(text="Seuls les administrateurs peuvent utiliser /config")
-    
-    await interaction.response.send_message(embed=embed, ephemeral=False)
-
-@tree.command(description="[ADMIN] Configurer le système de tickets pour ce serveur")
-@app_commands.describe(
-    channel_id="ID du salon où poster le message avec bouton",
-    message_text="Texte du message avec bouton",
-    ticket_message="Message envoyé dans le ticket (utilise {user} pour mentionner l'utilisateur) - OBLIGATOIRE",
-    staff_role_id="ID du rôle staff (optionnel)",
-    category_name="Nom de la catégorie des tickets (optionnel)"
-)
-async def config(interaction: discord.Interaction, channel_id: str, message_text: str, 
-                ticket_message: str, staff_role_id: str = None, category_name: str = None):
-    guild = interaction.guild
-    if not guild:
-        return await interaction.response.send_message(
-            "Cette commande doit être utilisée sur le serveur.", ephemeral=True
-        )
-
-    # Vérification permission ADMIN
-    if not interaction.user.guild_permissions.administrator:
-        return await interaction.response.send_message(
-            "❌ Seuls les administrateurs peuvent utiliser cette commande.", ephemeral=True
-        )
-
-    try:
-        channel = guild.get_channel(int(channel_id))
-        if not channel:
-            return await interaction.response.send_message(
-                "Salon introuvable.", ephemeral=True
-            )
-    except:
-        return await interaction.response.send_message(
-            "ID de salon invalide.", ephemeral=True
-        )
-
-    # Mettre à jour la configuration du serveur
-    updates = {}
-    # Le ticket_message est maintenant obligatoire
-    updates["ticket_message"] = ticket_message
-    if staff_role_id:
-        try:
-            updates["staff_role_id"] = int(staff_role_id)
-        except:
-            return await interaction.response.send_message(
-                "ID de rôle staff invalide.", ephemeral=True
-            )
-    if category_name:
-        updates["category_name"] = category_name
-    
-    if updates:
-        await update_server_config(guild.id, updates)
-
-    # Créer le message avec bouton
-    msg = await channel.send(message_text, view=TicketButton())
-    
-    # Sauvegarder le message de ticket
-    global ticket_messages
-    if guild.id not in ticket_messages:
-        ticket_messages[guild.id] = {}
-    ticket_messages[guild.id][msg.id] = channel.id
-    await add_ticket_message(guild.id, msg.id, channel.id)
-    
-    response_parts = [f"✅ Message configuré dans {channel.mention} avec bouton 'Ouvrir un ticket'."]
-    response_parts.append(f"✅ Message d'accueil du ticket : `{ticket_message}`")
-    if staff_role_id:
-        role = guild.get_role(int(staff_role_id))
-        if role:
-            response_parts.append(f"✅ Rôle staff configuré : {role.mention}")
-    if category_name:
-        response_parts.append(f"✅ Catégorie des tickets : `{category_name}`")
-
-    await interaction.response.send_message("\n".join(response_parts), ephemeral=True)
-
-# ----- Vérification automatique des messages de tickets (toutes les heures) -----
-@tasks.loop(hours=1)
-async def check_ticket_messages():
-    """Vérifier si les messages avec boutons de tickets existent encore"""
-    global ticket_messages
-    
-    # Charger les messages depuis la DB
-    ticket_messages = await load_ticket_messages()
-    
-    for guild_id, messages in ticket_messages.items():
-        guild = bot.get_guild(guild_id)
-        if not guild:
-            continue
-            
-        messages_copy = messages.copy()
-        for msg_id, channel_id in messages_copy.items():
-            channel = guild.get_channel(channel_id)
-            if not channel:
-                # Le salon n'existe plus
-                await remove_ticket_message(guild_id, msg_id)
-                del ticket_messages[guild_id][msg_id]
-                print(f"Message de ticket {msg_id} supprimé de la DB car le salon {channel_id} n'existe plus dans {guild.name}")
-                continue
-                
-            try:
-                await channel.fetch_message(msg_id)
-            except discord.NotFound:
-                # Le message n'existe plus
-                await remove_ticket_message(guild_id, msg_id)
-                del ticket_messages[guild_id][msg_id]
-                print(f"Message de ticket {msg_id} supprimé de la DB car le message n'existe plus dans {guild.name}")
-            except Exception as e:
-                print(f"Erreur lors de la vérification du message {msg_id}: {e}")
-        
-        # Nettoyer les entrées vides
-        if guild_id in ticket_messages and not ticket_messages[guild_id]:
-            del ticket_messages[guild_id]
-
-# ----- Vérification automatique des tickets ouverts -----
-@tasks.loop(minutes=2)
-async def check_tickets():
-    """Vérifier toutes les 2 minutes si les tickets ouverts existent encore"""
-    global open_tickets
-    
-    # Charger les tickets depuis la DB
-    open_tickets = await load_open_tickets()
-    
-    for key, ticket_data in open_tickets.copy().items():
-        channel_id = ticket_data["ticket_channel_id"]
-        guild_id = ticket_data["guild_id"]
-        user_id = ticket_data["user_id"]
-        
-        guild = bot.get_guild(guild_id)
-        if not guild:
-            # Le serveur n'existe plus ou le bot n'y est plus
-            await remove_open_ticket(user_id, guild_id)
-            del open_tickets[key]
-            print(f"Ticket {key} supprimé de la DB car le serveur {guild_id} n'est plus accessible.")
-            continue
-            
-        channel = guild.get_channel(channel_id)
-        if not channel:
-            # Le salon n'existe plus
-            await remove_open_ticket(user_id, guild_id)
-            del open_tickets[key]
-            print(f"Ticket {key} supprimé de la DB car le salon {channel_id} n'existe plus dans {guild.name}.")
-            continue
-
-# ----- on_ready -----
-@bot.event
-async def on_ready():
-    global status_messages, ticket_messages, open_tickets, close_button_messages
-    
-    # Initialiser la base de données
-    await init_database()
-    
-    await tree.sync()
-    print(f"[Manager] Connecté en tant que {bot.user}")
-
-    # Recharger toutes les données depuis la DB
-    ticket_messages = await load_ticket_messages()
-    open_tickets = await load_open_tickets()
-    close_button_messages = await load_close_button_messages()
-    status_messages = await load_status_messages()
-
-    # Restaurer les boutons des messages de ticket pour tous les serveurs
-    for guild_id, messages in ticket_messages.items():
-        guild = bot.get_guild(guild_id)
-        if not guild:
-            continue
-            
-        for msg_id, channel_id in messages.items():
-            channel = guild.get_channel(channel_id)
-            if channel:
-                try:
-                    msg = await channel.fetch_message(msg_id)
-                    await msg.edit(view=TicketButton())
-                    print(f"Bouton de ticket restauré pour le message {msg_id} dans {guild.name}")
-                except Exception as e:
-                    print(f"Erreur lors de la restauration du bouton de ticket {msg_id} dans {guild.name}: {e}")
-    
-    # Restaurer les boutons de fermeture des tickets
-    for msg_id, data in close_button_messages.items():
-        channel_id = data["channel_id"]
-        guild_id = data["guild_id"]
-        guild = bot.get_guild(guild_id)
-        if guild:
-            channel = guild.get_channel(channel_id)
-            if channel:
-                try:
-                    msg = await channel.fetch_message(msg_id)
-                    await msg.edit(view=CloseTicketButton())
-                    print(f"Bouton de fermeture restauré pour le message {msg_id} dans {guild.name}")
-                except Exception as e:
-                    print(f"Erreur lors de la restauration du bouton de fermeture {msg_id}: {e}")
-
-    # Initialiser les messages de status pour les serveurs configurés
-    async with db_pool.acquire() as conn:
-        rows = await conn.fetch('''
-            SELECT guild_id, status_channel_id FROM servers_config 
-            WHERE status_channel_id IS NOT NULL
-        ''')
-        
-        current_time = int(discord.utils.utcnow().timestamp())
-        
-        for row in rows:
-            guild_id = row["guild_id"]
-            status_channel_id = row["status_channel_id"]
-            
-            guild = bot.get_guild(guild_id)
-            if not guild:
-                print(f"Serveur {guild_id} non accessible au démarrage")
-                continue
-                
-            channel = guild.get_channel(status_channel_id)
-            if not channel:
-                print(f"Salon de status {status_channel_id} non trouvé dans {guild.name}")
-                continue
-            
-            message_created = False
-            
-            # Vérifier si on a déjà un message de status en DB
-            if guild_id in status_messages:
-                message_id = status_messages[guild_id]["message_id"]
-                try:
-                    msg = await channel.fetch_message(message_id)
-                    await msg.edit(content=f"✅ Bot en ligne (redémarré) - <t:{current_time}:R>")
-                    message_created = True
-                    print(f"Message de status restauré pour {guild.name}")
-                except discord.NotFound:
-                    print(f"Message de status {message_id} non trouvé dans {guild.name}, création d'un nouveau")
-                    # Le message n'existe plus, supprimer de la mémoire
-                    status_messages.pop(guild_id, None)
-                except Exception as e:
-                    print(f"Erreur lors de la restauration du status pour {guild.name}: {e}")
-            
-            # Si aucun message existant ou restauration échouée, créer un nouveau
-            if not message_created:
-                try:
-                    msg = await channel.send(f"✅ Bot en ligne (redémarré) - <t:{current_time}:R>")
-                    await save_status_message(guild_id, msg.id, channel.id)
-                    status_messages[guild_id] = {"message_id": msg.id, "channel_id": channel.id}
-                    print(f"Nouveau message de status créé au démarrage pour {guild.name}")
-                except discord.Forbidden:
-                    print(f"Pas de permission pour envoyer un message dans le salon de status de {guild.name}")
-                except Exception as e:
-                    print(f"Erreur lors de la création du message de status pour {guild.name}: {e}")
-
-    # Démarrer les tâches
-    update_status.start()
-    check_tickets.start()
-    check_ticket_messages.start()
-    
-    print(f"Bot prêt ! Configuré sur {len(ticket_messages)} serveur(s) avec des messages de tickets.")
-    print(f"Tickets ouverts actuellement: {len(open_tickets)}")
-    print(f"Messages de status configurés: {len(status_messages)}")
-    
-    # Afficher un résumé des serveurs configurés
-    for guild_id, messages in ticket_messages.items():
-        guild = bot.get_guild(guild_id)
-        guild_name = guild.name if guild else f"Serveur {guild_id} (inaccessible)"
-        tickets_count = len(messages)
-        print(f"  - {guild_name}: {tickets_count} message(s) de tickets configuré(s)")
-
-# ----- Gestion propre de la fermeture -----
-async def cleanup_on_exit():
-    """Fermer proprement la connexion à la base de données"""
-    global db_pool
-    if db_pool:
-        await db_pool.close()
-        print("🔌 Connexion PostgreSQL fermée")
-
-# ----- Keep alive pour Render -----
+import os
+from datetime import datetime, timedelta
+import asyncio
+from typing import Dict, List, Optional
 import threading
-from flask import Flask
+import time
 
-app = Flask("")
+# ---------- Configuration Redis ----------
+redis_client = redis.Redis(
+    host=os.getenv("REDIS_HOST", "localhost"),
+    port=int(os.getenv("REDIS_PORT", 6379)),
+    password=os.getenv("REDIS_PASSWORD"),
+    decode_responses=True,
+    socket_keepalive=True,
+    socket_keepalive_options={},
+    health_check_interval=30
+)
 
-@app.route("/")
-def home():
-    return "Bot en ligne !"
+# ---------- Configuration des serveurs/rôles ----------
+MAIN_GUILD_ID = 1408449935870791841  # Serveur principal
+REQUIRED_ROLE_ID = 1410986350877868042  # Rôle requis
+STATUS_CHANNEL_ID = 1408498176003932422  # Channel de statut
 
-def run_flask():
-    app.run(host="0.0.0.0", port=10000)
-
-threading.Thread(target=run_flask).start()
-
-# ----- Lancement du bot -----
-if __name__ == "__main__":
-    import signal
+class RedisManager:
+    """Gestionnaire Redis avec retry automatique"""
     
-    def signal_handler(sig, frame):
-        print("\n🛑 Arrêt du bot demandé...")
-        import asyncio
-        asyncio.create_task(cleanup_on_exit())
-        exit(0)
+    @staticmethod
+    def safe_operation(operation, *args, **kwargs):
+        """Wrapper pour les opérations Redis avec retry"""
+        max_retries = 3
+        for attempt in range(max_retries):
+            try:
+                return operation(*args, **kwargs)
+            except redis.ConnectionError as e:
+                if attempt == max_retries - 1:
+                    print(f"Redis connexion échouée après {max_retries} tentatives: {e}")
+                    return None
+                time.sleep(2 ** attempt)
+            except Exception as e:
+                print(f"Erreur Redis: {e}")
+                return None
+        return None
+
+class MultiBot:
+    def __init__(self):
+        self.bots: Dict[str, commands.Bot] = {}
+        self.status_managers: Dict[str, 'StatusManager'] = {}
+        self.running = False
+        
+    async def create_bot(self, token: str, user_id: str) -> Optional[commands.Bot]:
+        """Crée un nouveau bot avec le token donné"""
+        try:
+            intents = discord.Intents.all()
+            bot = commands.Bot(command_prefix="!", intents=intents)
+            bot.owner_id = user_id
+            
+            # Événements du bot
+            @bot.event
+            async def on_ready():
+                print(f"Bot {bot.user} connecté pour l'utilisateur {user_id}")
+                
+                # Synchroniser les commandes slash avec retry
+                max_retries = 3
+                for attempt in range(max_retries):
+                    try:
+                        synced = await bot.tree.sync()
+                        print(f"{len(synced)} commandes synchronisées pour {bot.user} (tentative {attempt + 1})")
+                        break
+                    except discord.HTTPException as e:
+                        if attempt == max_retries - 1:
+                            print(f"Échec sync commandes après {max_retries} tentatives: {e}")
+                        else:
+                            print(f"Retry sync commandes (tentative {attempt + 1}): {e}")
+                            await asyncio.sleep(2 ** attempt)
+                    except Exception as e:
+                        print(f"Erreur inattendue sync commandes: {e}")
+                        break
+                
+                # Créer le gestionnaire de statut
+                if token not in self.status_managers:
+                    self.status_managers[token] = StatusManager(bot, STATUS_CHANNEL_ID)
+                    try:
+                        if not self.status_managers[token].update_status.is_running():
+                            self.status_managers[token].update_status.start()
+                    except Exception as e:
+                        print(f"Erreur démarrage StatusManager: {e}")
+            
+            @bot.event
+            async def on_disconnect():
+                print(f"Bot {bot.user} déconnecté")
+            
+            @bot.event
+            async def on_resumed():
+                print(f"Bot {bot.user} reconnecté")
+            
+            @bot.event
+            async def on_error(event, *args, **kwargs):
+                print(f"Erreur dans {event}: {args}")
+            
+            # Commandes du bot
+            self.setup_commands(bot, user_id)
+            
+            # Stocker le bot
+            self.bots[user_id] = bot
+            
+            return bot
+            
+        except discord.LoginFailure:
+            print(f"Token invalide pour l'utilisateur {user_id}")
+            self.remove_token(user_id)
+            return None
+        except Exception as e:
+            print(f"Erreur lors de la création du bot pour {user_id}: {e}")
+            return None
     
-    signal.signal(signal.SIGINT, signal_handler)
-    signal.signal(signal.SIGTERM, signal_handler)
+    def setup_commands(self, bot: commands.Bot, owner_id: str):
+        """Configure les commandes pour le bot"""
+        
+        @bot.tree.command(name="help", description="Affiche toutes les commandes disponibles")
+        async def help_command(interaction: discord.Interaction):
+            try:
+                embed = discord.Embed(
+                    title="Aide - Commandes du Bot",
+                    description="Voici toutes les commandes disponibles :",
+                    color=0x00ff00
+                )
+                
+                # Commandes pour tous les utilisateurs
+                embed.add_field(
+                    name="Commandes Générales",
+                    value=(
+                        "`/help` - Affiche cette aide\n"
+                        "`/addtoken` - Ajouter votre token de bot (DM uniquement)\n"
+                    ),
+                    inline=False
+                )
+                
+                # Commandes de modération
+                embed.add_field(
+                    name="Commandes de Modération",
+                    value=(
+                        "`/ban <utilisateur> [raison]` - Bannir un utilisateur\n"
+                        "`/kick <utilisateur> <durée> [raison]` - Exclure temporairement\n"
+                        "`/warn <utilisateur> [raison]` - Donner un avertissement\n"
+                    ),
+                    inline=False
+                )
+                
+                # Commandes d'administration
+                embed.add_field(
+                    name="Commandes d'Administration",
+                    value=(
+                        "`/configrole` - Configurer les permissions d'un rôle\n"
+                        "`/roleownerbot <rôle>` - Donner permissions owner à un rôle\n"
+                        "`/deflimwarn <nombre>` - Définir limite d'avertissements\n"
+                    ),
+                    inline=False
+                )
+                
+                embed.set_footer(text="Multi-Bot System | Utilisez les commandes avec responsabilité")
+                await interaction.response.send_message(embed=embed, ephemeral=True)
+                
+            except Exception as e:
+                print(f"Erreur commande help: {e}")
+                try:
+                    if not interaction.response.is_done():
+                        await interaction.response.send_message("Erreur lors de l'affichage de l'aide.", ephemeral=True)
+                    else:
+                        await interaction.followup.send("Erreur lors de l'affichage de l'aide.", ephemeral=True)
+                except:
+                    pass
+        
+        @bot.tree.command(name="addtoken", description="Ajouter votre token de bot")
+        async def addtoken(interaction: discord.Interaction):
+            try:
+                # Vérifier si l'utilisateur a le bon rôle sur le serveur principal
+                has_permission = await self.check_user_permission(interaction.user.id)
+                if not has_permission:
+                    return await interaction.response.send_message(
+                        "Vous n'avez pas les permissions nécessaires.", ephemeral=True
+                    )
+                
+                await interaction.response.send_message(
+                    "Envoyez-moi votre token de bot en message privé (DM). "
+                    "**Attention: Ne partagez JAMAIS votre token publiquement!**", 
+                    ephemeral=True
+                )
+                
+                # Attendre le DM avec le token
+                def check(m):
+                    return (m.author.id == interaction.user.id and 
+                           isinstance(m.channel, discord.DMChannel))
+                
+                try:
+                    token_msg = await bot.wait_for("message", check=check, timeout=180)  # 3 minutes
+                    token = token_msg.content.strip()
+                    
+                    # Valider le token
+                    if await self.validate_and_store_token(str(interaction.user.id), token):
+                        await token_msg.author.send("Token ajouté avec succès!")
+                        
+                        # Créer et démarrer le nouveau bot
+                        try:
+                            new_bot = await self.create_bot(token, str(interaction.user.id))
+                            if new_bot:
+                                # Démarrer dans une tâche avec gestion d'erreur
+                                async def safe_start():
+                                    try:
+                                        await new_bot.start(token)
+                                    except Exception as start_error:
+                                        print(f"Erreur démarrage bot {interaction.user.id}: {start_error}")
+                                        if str(interaction.user.id) in self.bots:
+                                            del self.bots[str(interaction.user.id)]
+                                
+                                asyncio.create_task(safe_start())
+                        except Exception as create_error:
+                            print(f"Erreur création bot: {create_error}")
+                            await token_msg.author.send("Erreur lors de la création du bot.")
+                    else:
+                        await token_msg.author.send("Token invalide ou erreur lors de l'ajout.")
+                        
+                except asyncio.TimeoutError:
+                    try:
+                        await interaction.followup.send("Temps écoulé. Réessayez.", ephemeral=True)
+                    except:
+                        pass
+                        
+            except Exception as e:
+                print(f"Erreur commande addtoken: {e}")
+                try:
+                    if not interaction.response.is_done():
+                        await interaction.response.send_message("Une erreur s'est produite.", ephemeral=True)
+                    else:
+                        await interaction.followup.send("Une erreur s'est produite.", ephemeral=True)
+                except:
+                    pass
+        
+        @bot.tree.command(name="configrole", description="Configurer les permissions d'un rôle")
+        async def configrole(interaction: discord.Interaction):
+            try:
+                # Vérifier si l'utilisateur peut utiliser cette commande
+                if not await self.can_use_owner_commands(interaction.user, interaction.guild):
+                    return await interaction.response.send_message(
+                        "Vous n'avez pas les permissions pour utiliser cette commande.", ephemeral=True
+                    )
+                
+                await self.handle_role_config(interaction)
+            except Exception as e:
+                print(f"Erreur configrole: {e}")
+                try:
+                    if not interaction.response.is_done():
+                        await interaction.response.send_message("Erreur lors de la configuration.", ephemeral=True)
+                except:
+                    pass
+        
+        @bot.tree.command(name="roleownerbot", description="Donner les permissions d'owner à un rôle")
+        async def roleownerbot(interaction: discord.Interaction, role: discord.Role):
+            try:
+                # Seul le vrai propriétaire peut utiliser cette commande
+                if str(interaction.user.id) != owner_id:
+                    return await interaction.response.send_message(
+                        "Seul le propriétaire du bot peut utiliser cette commande.", ephemeral=True
+                    )
+                
+                # Ajouter le rôle aux owners
+                key = f"owner_roles:{interaction.guild.id}"
+                RedisManager.safe_operation(redis_client.sadd, key, str(role.id))
+                
+                await interaction.response.send_message(
+                    f"Le rôle {role.mention} peut maintenant utiliser les commandes d'administration.", 
+                    ephemeral=True
+                )
+            except Exception as e:
+                print(f"Erreur roleownerbot: {e}")
+                try:
+                    await interaction.response.send_message("Erreur lors de la configuration du rôle.", ephemeral=True)
+                except:
+                    pass
+        
+        @bot.tree.command(name="deflimwarn", description="Définir la limite d'avertissements avant kick")
+        async def deflimwarn(interaction: discord.Interaction, limite: int):
+            try:
+                # Vérifier les permissions
+                if not await self.can_use_owner_commands(interaction.user, interaction.guild):
+                    return await interaction.response.send_message(
+                        "Vous n'avez pas les permissions pour utiliser cette commande.", ephemeral=True
+                    )
+                
+                if limite < 1 or limite > 20:
+                    return await interaction.response.send_message(
+                        "La limite doit être entre 1 et 20 avertissements.", ephemeral=True
+                    )
+                
+                ModerationManager.set_warn_limit(str(interaction.guild.id), limite)
+                await interaction.response.send_message(
+                    f"Limite d'avertissements définie à {limite}.", ephemeral=True
+                )
+            except Exception as e:
+                print(f"Erreur deflimwarn: {e}")
+                try:
+                    await interaction.response.send_message("Erreur lors de la configuration.", ephemeral=True)
+                except:
+                    pass
+        
+        @bot.tree.command(name="ban", description="Bannir un utilisateur (ajouter à la liste noire)")
+        async def ban_user(interaction: discord.Interaction, user: discord.User, raison: str = "Aucune raison"):
+            await self.handle_moderation_action(interaction, "ban", user, raison)
+        
+        @bot.tree.command(name="kick", description="Exclure temporairement un utilisateur")
+        async def kick_user(interaction: discord.Interaction, user: discord.User, temps: str, raison: str = "Aucune raison"):
+            await self.handle_moderation_action(interaction, "kick", user, raison, temps)
+        
+        @bot.tree.command(name="warn", description="Donner un avertissement à un utilisateur")
+        async def warn_user(interaction: discord.Interaction, user: discord.User, raison: str = "Aucune raison"):
+            await self.handle_moderation_action(interaction, "warn", user, raison)
     
-    token = os.getenv("DISCORD_TOKEN")
-    if not token:
-        print("❌ DISCORD_TOKEN manquant dans les variables d'environnement")
-        exit(1)
+    async def can_use_owner_commands(self, user: discord.User, guild: discord.Guild) -> bool:
+        """Vérifie si un utilisateur peut utiliser les commandes d'owner"""
+        try:
+            # Le propriétaire original du bot peut toujours utiliser
+            if any(str(bot.owner_id) == str(user.id) for bot in self.bots.values() if hasattr(bot, 'owner_id')):
+                return True
+            
+            # Vérifier si l'utilisateur a un rôle owner
+            key = f"owner_roles:{guild.id}"
+            owner_role_ids = RedisManager.safe_operation(redis_client.smembers, key) or set()
+            
+            member = guild.get_member(user.id)
+            if member and owner_role_ids:
+                user_role_ids = {str(role.id) for role in member.roles}
+                return bool(owner_role_ids.intersection(user_role_ids))
+                
+            return False
+        except Exception as e:
+            print(f"Erreur vérification owner: {e}")
+            return False
     
+    async def handle_moderation_action(self, interaction: discord.Interaction, action: str, target_user: discord.User, reason: str, duration: str = None):
+        """Gère les actions de modération avec système de crédits"""
+        try:
+            # Vérifier les permissions de base
+            user_roles = [role for role in interaction.user.roles if role != interaction.guild.default_role]
+            if not user_roles:
+                return await interaction.response.send_message(
+                    "Vous n'avez aucun rôle configuré pour la modération.", ephemeral=True
+                )
+            
+            # Trouver le rôle avec les meilleures permissions
+            best_role = None
+            best_permissions = {"ban": False, "kick": False, "warn": False}
+            
+            for role in user_roles:
+                perms = ModerationManager.get_role_permissions(str(interaction.guild.id), str(role.id))
+                if perms.get(action):
+                    best_role = role
+                    best_permissions = perms
+                    break
+            
+            if not best_role or not best_permissions.get(action):
+                return await interaction.response.send_message(
+                    f"Vous n'avez pas la permission d'utiliser {action.upper()}.", ephemeral=True
+                )
+            
+            # Vérifier les crédits quotidiens
+            credits = ModerationManager.get_daily_credits(str(interaction.user.id), str(interaction.guild.id))
+            
+            # Si le rôle a changé, réinitialiser les crédits
+            if credits["role_id"] != str(best_role.id):
+                credits = {"ban": 0, "kick": 0, "warn": 0, "role_id": str(best_role.id)}
+            
+            # Vérifier la limite de crédits
+            max_credits = self.parse_credit_limit(best_permissions.get(action))
+            if max_credits > 0 and credits[action] >= max_credits:
+                return await interaction.response.send_message(
+                    f"Vous avez atteint votre limite quotidienne de {action.upper()} ({max_credits}).", 
+                    ephemeral=True
+                )
+            
+            # Exécuter l'action
+            embed = None
+            if action == "ban":
+                ModerationManager.add_to_blacklist(
+                    str(interaction.guild.id), str(target_user.id), reason, str(interaction.user.id)
+                )
+                
+                embed = discord.Embed(
+                    title="Utilisateur banni",
+                    description=f"{target_user.mention} a été ajouté à la liste noire.",
+                    color=0xff0000
+                )
+                embed.add_field(name="Raison", value=reason, inline=False)
+                embed.add_field(name="Modérateur", value=interaction.user.mention, inline=True)
+                
+            elif action == "kick":
+                embed = discord.Embed(
+                    title="Utilisateur exclu temporairement",
+                    description=f"{target_user.mention} a été exclu temporairement.",
+                    color=0xffa500
+                )
+                embed.add_field(name="Durée", value=duration, inline=True)
+                embed.add_field(name="Raison", value=reason, inline=False)
+                embed.add_field(name="Modérateur", value=interaction.user.mention, inline=True)
+                
+                # Envoyer DM à l'utilisateur
+                try:
+                    dm_embed = discord.Embed(
+                        title="Exclusion temporaire",
+                        description=f"Vous avez été exclu temporairement de {interaction.guild.name}",
+                        color=0xffa500
+                    )
+                    dm_embed.add_field(name="Durée", value=duration, inline=True)
+                    dm_embed.add_field(name="Raison", value=reason, inline=False)
+                    await target_user.send(embed=dm_embed)
+                except:
+                    pass
+                
+            elif action == "warn":
+                # Ajouter l'avertissement
+                warning_count = ModerationManager.add_warning(
+                    str(interaction.guild.id), str(target_user.id), reason, str(interaction.user.id)
+                )
+                
+                warn_limit = ModerationManager.get_warn_limit(str(interaction.guild.id))
+                
+                embed = discord.Embed(
+                    title="Avertissement donné",
+                    description=f"{target_user.mention} a reçu un avertissement ({warning_count}/{warn_limit})",
+                    color=0xffff00
+                )
+                embed.add_field(name="Raison", value=reason, inline=False)
+                embed.add_field(name="Modérateur", value=interaction.user.mention, inline=True)
+                
+                # Envoyer DM à l'utilisateur
+                try:
+                    dm_embed = discord.Embed(
+                        title="Avertissement reçu",
+                        description=f"Vous avez reçu un avertissement sur {interaction.guild.name}",
+                        color=0xffff00
+                    )
+                    dm_embed.add_field(name="Raison", value=reason, inline=False)
+                    dm_embed.add_field(name="Total", value=f"{warning_count}/{warn_limit}", inline=True)
+                    await target_user.send(embed=dm_embed)
+                except:
+                    pass
+                
+                # Vérifier si kick automatique
+                if warning_count >= warn_limit:
+                    embed.add_field(
+                        name="Action automatique", 
+                        value=f"Limite d'avertissements atteinte! Kick automatique recommandé.", 
+                        inline=False
+                    )
+            
+            # Mettre à jour les crédits
+            ModerationManager.set_daily_credits(
+                str(interaction.user.id), str(interaction.guild.id), 
+                action, credits[action] + 1, str(best_role.id)
+            )
+            
+            # Ajouter info crédits à l'embed
+            remaining = max_credits - (credits[action] + 1) if max_credits > 0 else "∞"
+            embed.add_field(name="Crédits restants", value=f"{remaining}", inline=True)
+            
+            await interaction.response.send_message(embed=embed)
+            
+        except Exception as e:
+            print(f"Erreur modération: {e}")
+            try:
+                if not interaction.response.is_done():
+                    await interaction.response.send_message(f"Erreur: {e}", ephemeral=True)
+                else:
+                    await interaction.followup.send(f"Erreur: {e}", ephemeral=True)
+            except:
+                pass
+    
+    def parse_credit_limit(self, permission_value) -> int:
+        """Parse la valeur de permission pour extraire la limite"""
+        try:
+            if isinstance(permission_value, bool):
+                return 0 if permission_value else -1
+            elif isinstance(permission_value, str):
+                if permission_value.lower() in ["non", "false", "0"]:
+                    return -1
+                elif permission_value.lower() in ["oui", "true", "illimité", "unlimited"]:
+                    return 0
+                else:
+                    return int(permission_value)
+            elif isinstance(permission_value, int):
+                return permission_value
+        except:
+            pass
+        return -1
+    
+    async def check_user_permission(self, user_id: int) -> bool:
+        """Vérifie si l'utilisateur a le rôle requis sur le serveur principal"""
+        try:
+            # Trouver un bot connecté pour vérifier
+            available_bot = None
+            for bot in self.bots.values():
+                if bot and bot.is_ready():
+                    available_bot = bot
+                    break
+            
+            if not available_bot:
+                print("Aucun bot disponible pour vérifier les permissions")
+                return False
+                
+            guild = available_bot.get_guild(MAIN_GUILD_ID)
+            if not guild:
+                print(f"Serveur {MAIN_GUILD_ID} introuvable")
+                return False
+                
+            member = guild.get_member(user_id)
+            if not member:
+                print(f"Membre {user_id} introuvable sur le serveur")
+                return False
+                
+            required_role = guild.get_role(REQUIRED_ROLE_ID)
+            if not required_role:
+                print(f"Rôle {REQUIRED_ROLE_ID} introuvable")
+                return False
+                
+            has_role = required_role in member.roles
+            print(f"Vérification permission {user_id}: {'OK' if has_role else 'KO'}")
+            return has_role
+            
+        except Exception as e:
+            print(f"Erreur vérification permission {user_id}: {e}")
+            return False
+    
+    async def validate_and_store_token(self, user_id: str, token: str) -> bool:
+        """Valide et stocke un token"""
+        try:
+            # Tester la connexion avec le token
+            test_bot = discord.Client(intents=discord.Intents.default())
+            await test_bot.login(token)
+            bot_user = test_bot.user
+            await test_bot.close()
+            
+            # Stocker dans Redis
+            token_data = {
+                "user_id": user_id,
+                "bot_name": str(bot_user),
+                "bot_id": str(bot_user.id),
+                "added_date": datetime.utcnow().isoformat()
+            }
+            
+            RedisManager.safe_operation(redis_client.hset, f"bot_token:{user_id}", mapping=token_data)
+            RedisManager.safe_operation(redis_client.set, f"token_raw:{user_id}", token)
+            
+            print(f"Token validé et stocké pour {user_id} ({bot_user})")
+            return True
+            
+        except Exception as e:
+            print(f"Erreur validation token: {e}")
+            return False
+    
+    def remove_token(self, user_id: str):
+        """Supprime un token de la base de données"""
+        try:
+            RedisManager.safe_operation(redis_client.delete, f"bot_token:{user_id}")
+            RedisManager.safe_operation(redis_client.delete, f"token_raw:{user_id}")
+            print(f"Token supprimé pour l'utilisateur {user_id}")
+        except Exception as e:
+            print(f"Erreur suppression token: {e}")
+    
+    def get_stored_tokens(self) -> Dict[str, str]:
+        """Récupère tous les tokens stockés"""
+        tokens = {}
+        try:
+            for key in redis_client.scan_iter(match="token_raw:*"):
+                user_id = key.split(":")[-1]
+                token = RedisManager.safe_operation(redis_client.get, key)
+                if token:
+                    tokens[user_id] = token
+        except Exception as e:
+            print(f"Erreur récupération tokens: {e}")
+        return tokens
+    
+    async def handle_role_config(self, interaction: discord.Interaction):
+        """Gère la configuration des rôles"""
+        try:
+            await interaction.response.send_message(
+                "Quel rôle voulez-vous configurer ? (écrivez le nom)", ephemeral=True
+            )
+            
+            def check(m):
+                return m.author == interaction.user and m.channel == interaction.channel
+            
+            # Récupérer le bot correspondant à cet utilisateur
+            bot = None
+            for b in self.bots.values():
+                if hasattr(b, 'owner_id') and b.owner_id == str(interaction.user.id):
+                    bot = b
+                    break
+            
+            if not bot:
+                return await interaction.followup.send("Bot non trouvé.", ephemeral=True)
+            
+            role_msg = await bot.wait_for("message", check=check, timeout=300)
+            role_name = role_msg.content
+            role = discord.utils.get(interaction.guild.roles, name=role_name)
+            
+            if not role:
+                return await interaction.followup.send("Rôle introuvable.", ephemeral=True)
+            
+            # Configuration des permissions
+            role_data = {"ban": None, "kick": None, "warn": None}
+            actions = ["ban", "kick", "warn"]
+            
+            for action in actions:
+                await interaction.followup.send(
+                    f"Voulez-vous que ce rôle puisse {action.upper()} ? (oui/non)", ephemeral=True
+                )
+                ans = await bot.wait_for("message", check=check, timeout=300)
+                
+                if ans.content.lower() == "oui":
+                    if action in ["ban", "kick"]:
+                        await interaction.followup.send(
+                            f"Quelle limite pour {action.upper()} ? (nombre ou 'non' pour illimité)", 
+                            ephemeral=True
+                        )
+                        limit_msg = await bot.wait_for("message", check=check, timeout=300)
+                        role_data[action] = limit_msg.content
+                    else:
+                        role_data[action] = True
+                else:
+                    role_data[action] = False
+            
+            # Sauvegarder dans Redis
+            redis_key = f"role_config:{interaction.guild.id}:{role.id}"
+            RedisManager.safe_operation(redis_client.hset, redis_key, mapping={
+                "role_name": role.name,
+                "config": json.dumps(role_data),
+                "updated_by": str(interaction.user.id),
+                "updated_at": datetime.utcnow().isoformat()
+            })
+            
+            await interaction.followup.send(
+                f"Configuration du rôle {role.name} enregistrée.", ephemeral=True
+            )
+            
+        except asyncio.TimeoutError:
+            try:
+                await interaction.followup.send("Temps écoulé.", ephemeral=True)
+            except:
+                pass
+        except Exception as e:
+            print(f"Erreur handle_role_config: {e}")
+            try:
+                await interaction.followup.send(f"Erreur: {e}", ephemeral=True)
+            except:
+                pass
+
+class StatusManager:
+    def __init__(self, bot: commands.Bot, channel_id: int):
+        self.bot = bot
+        self.channel_id = channel_id
+        self.status_message_id = None
+        self.bot_user_id = str(bot.user.id) if bot.user else "unknown"
+        self.load_status_message()
+    
+    def load_status_message(self):
+        """Charge l'ID du message de statut depuis Redis"""
+        try:
+            msg_id = RedisManager.safe_operation(redis_client.get, f"status_msg:{self.bot_user_id}")
+            self.status_message_id = int(msg_id) if msg_id else None
+        except Exception as e:
+            print(f"Erreur chargement status: {e}")
+    
+    def save_status_message(self, msg_id: int):
+        """Sauvegarde l'ID du message de statut"""
+        self.status_message_id = msg_id
+        RedisManager.safe_operation(redis_client.set, f"status_msg:{self.bot_user_id}", str(msg_id))
+    
+    @tasks.loop(minutes=30)
+    async def update_status(self):
+        """Met à jour le message de statut"""
+        if not self.bot.is_ready():
+            return
+            
+        channel = self.bot.get_channel(self.channel_id)
+        if not channel:
+            return
+        
+        try:
+            # Supprimer l'ancien message s'il existe
+            if self.status_message_id:
+                try:
+                    old_msg = await channel.fetch_message(self.status_message_id)
+                    # Vérifier que c'est bien notre message
+                    if old_msg.author.id == self.bot.user.id:
+                        await old_msg.delete()
+                except (discord.NotFound, discord.Forbidden, discord.HTTPException):
+                    pass
+            
+            # Envoyer le nouveau message
+            timestamp = int(datetime.utcnow().timestamp())
+            content = f"✅ {self.bot.user.name} en ligne (<t:{timestamp}:R>)"
+            msg = await channel.send(content)
+            self.save_status_message(msg.id)
+                    
+        except discord.Forbidden:
+            print(f"Permission refusée pour le status de {self.bot.user}")
+        except Exception as e:
+            print(f"Erreur update status {self.bot.user}: {e}")
+    
+    @update_status.before_loop
+    async def before_update_status(self):
+        await self.bot.wait_until_ready()
+
+class ModerationManager:
+    """Gestionnaire de modération avec système de crédits"""
+    
+    @staticmethod
+    def get_daily_credits(user_id: str, guild_id: str) -> Dict:
+        """Récupère les crédits quotidiens d'un utilisateur"""
+        today = datetime.utcnow().strftime("%Y-%m-%d")
+        key = f"daily_credits:{guild_id}:{user_id}:{today}"
+        
+        credits_data = RedisManager.safe_operation(redis_client.hgetall, key) or {}
+        if not credits_data:
+            return {"ban": 0, "kick": 0, "warn": 0, "role_id": None}
+        
+        return {
+            "ban": int(credits_data.get("ban", 0)),
+            "kick": int(credits_data.get("kick", 0)), 
+            "warn": int(credits_data.get("warn", 0)),
+            "role_id": credits_data.get("role_id")
+        }
+    
+    @staticmethod
+    def set_daily_credits(user_id: str, guild_id: str, action: str, used: int, role_id: str):
+        """Met à jour les crédits quotidiens"""
+        today = datetime.utcnow().strftime("%Y-%m-%d")
+        key = f"daily_credits:{guild_id}:{user_id}:{today}"
+        
+        RedisManager.safe_operation(redis_client.hset, key, mapping={
+            action: str(used),
+            "role_id": role_id,
+            "updated_at": datetime.utcnow().isoformat()
+        })
+        # Expiration automatique après 2 jours
+        RedisManager.safe_operation(redis_client.expire, key, 172800)
+    
+    @staticmethod
+    def get_role_permissions(guild_id: str, role_id: str) -> Dict:
+        """Récupère les permissions d'un rôle"""
+        try:
+            key = f"role_config:{guild_id}:{role_id}"
+            role_data = RedisManager.safe_operation(redis_client.hgetall, key) or {}
+            if role_data and "config" in role_data:
+                return json.loads(role_data["config"])
+            return {"ban": False, "kick": False, "warn": False}
+        except Exception as e:
+            print(f"Erreur récupération permissions: {e}")
+            return {"ban": False, "kick": False, "warn": False}
+    
+    @staticmethod
+    def get_warn_limit(guild_id: str) -> int:
+        """Récupère la limite d'avertissements avant kick"""
+        try:
+            limit = RedisManager.safe_operation(redis_client.get, f"warn_limit:{guild_id}")
+            return int(limit) if limit else 3
+        except:
+            return 3
+    
+    @staticmethod
+    def set_warn_limit(guild_id: str, limit: int):
+        """Définit la limite d'avertissements"""
+        RedisManager.safe_operation(redis_client.set, f"warn_limit:{guild_id}", str(limit))
+    
+    @staticmethod
+    def add_warning(guild_id: str, user_id: str, reason: str, moderator_id: str):
+        """Ajoute un avertissement à un utilisateur"""
+        key = f"warnings:{guild_id}:{user_id}"
+        warning_data = {
+            "reason": reason,
+            "moderator_id": moderator_id,
+            "timestamp": datetime.utcnow().isoformat()
+        }
+        
+        # Ajouter à la liste des avertissements
+        RedisManager.safe_operation(redis_client.lpush, key, json.dumps(warning_data))
+        
+        # Garder seulement les 50 derniers avertissements
+        RedisManager.safe_operation(redis_client.ltrim, key, 0, 49)
+        
+        # Retourner le nombre total d'avertissements
+        return RedisManager.safe_operation(redis_client.llen, key) or 0
+    
+    @staticmethod
+    def get_warning_count(guild_id: str, user_id: str) -> int:
+        """Récupère le nombre d'avertissements d'un utilisateur"""
+        key = f"warnings:{guild_id}:{user_id}"
+        return RedisManager.safe_operation(redis_client.llen, key) or 0
+    
+    @staticmethod
+    def add_to_blacklist(guild_id: str, user_id: str, reason: str, moderator_id: str):
+        """Ajoute un utilisateur à la liste noire"""
+        key = f"blacklist:{guild_id}"
+        blacklist_data = {
+            "user_id": user_id,
+            "reason": reason,
+            "moderator_id": moderator_id,
+            "timestamp": datetime.utcnow().isoformat()
+        }
+        RedisManager.safe_operation(redis_client.hset, key, user_id, json.dumps(blacklist_data))
+
+# ---------- Gestionnaire principal ----------
+multi_bot = MultiBot()
+
+class BackgroundTasks:
+    """Gestionnaire des tâches en arrière-plan pour éviter les problèmes avec asyncio sur Render"""
+    
+    def __init__(self):
+        self.tasks_running = False
+        self.thread = None
+    
+    def start_background_tasks(self):
+        """Démarre les tâches en arrière-plan dans un thread séparé"""
+        if not self.tasks_running:
+            self.tasks_running = True
+            self.thread = threading.Thread(target=self._run_background_loop, daemon=True)
+            self.thread.start()
+            print("Tâches en arrière-plan démarrées")
+    
+    def stop_background_tasks(self):
+        """Arrête les tâches en arrière-plan"""
+        self.tasks_running = False
+        if self.thread and self.thread.is_alive():
+            self.thread.join(timeout=5)
+    
+    def _run_background_loop(self):
+        """Boucle principale des tâches en arrière-plan"""
+        while self.tasks_running:
+            try:
+                # Vérification quotidienne des rôles (toutes les 24h)
+                self._check_user_roles()
+                
+                # Nettoyage des anciens crédits (toutes les heures)
+                self._cleanup_old_credits()
+                
+                # Attendre 1 heure avant la prochaine vérification
+                time.sleep(3600)
+                
+            except Exception as e:
+                print(f"Erreur tâche arrière-plan: {e}")
+                time.sleep(300)  # Attendre 5 minutes en cas d'erreur
+    
+    def _check_user_roles(self):
+        """Vérifie si les utilisateurs ont toujours le rôle requis"""
+        try:
+            tokens = multi_bot.get_stored_tokens()
+            for user_id in list(tokens.keys()):
+                print(f"Vérification du rôle pour l'utilisateur {user_id}")
+                # Cette vérification nécessiterait une implémentation asyncio complète
+                
+        except Exception as e:
+            print(f"Erreur vérification rôles: {e}")
+    
+    def _cleanup_old_credits(self):
+        """Nettoie les anciens crédits"""
+        try:
+            yesterday = (datetime.utcnow() - timedelta(days=2)).strftime("%Y-%m-%d")
+            
+            # Supprimer les anciens crédits
+            count = 0
+            for key in redis_client.scan_iter(match=f"daily_credits:*:{yesterday}"):
+                RedisManager.safe_operation(redis_client.delete, key)
+                count += 1
+            
+            if count > 0:
+                print(f"{count} anciens crédits supprimés")
+                
+        except Exception as e:
+            print(f"Erreur nettoyage crédits: {e}")
+
+# Gestionnaire des tâches
+background_tasks = BackgroundTasks()
+
+async def start_all_bots():
+    """Démarre tous les bots stockés"""
     try:
-        bot.run(token)
+        stored_tokens = multi_bot.get_stored_tokens()
+        
+        if not stored_tokens:
+            print("Aucun token utilisateur stocké")
+            return
+        
+        print(f"Démarrage de {len(stored_tokens)} bots utilisateur...")
+        
+        for user_id, token in stored_tokens.items():
+            try:
+                bot = await multi_bot.create_bot(token, user_id)
+                if bot:
+                    # Démarrer le bot dans une tâche séparée avec gestion d'erreur
+                    async def start_bot_safely(b, t, uid):
+                        try:
+                            await b.start(t)
+                        except Exception as e:
+                            print(f"Bot {uid} crashé: {e}")
+                            # Nettoyer le bot de la liste
+                            if uid in multi_bot.bots:
+                                del multi_bot.bots[uid]
+                    
+                    asyncio.create_task(start_bot_safely(bot, token, user_id))
+                    print(f"Bot pour {user_id} créé et en cours de démarrage...")
+                    
+                    # Petite pause pour éviter la surcharge
+                    await asyncio.sleep(2)
+                    
+            except Exception as e:
+                print(f"Erreur création bot {user_id}: {e}")
+                continue
+                
+    except Exception as e:
+        print(f"Erreur démarrage bots: {e}")
+
+async def start_bot(main_token: str):
+    """Démarre le système multi-bots de manière optimisée pour Render"""
+    try:
+        print("Initialisation du système multi-bots...")
+        
+        # Démarrer les tâches en arrière-plan
+        background_tasks.start_background_tasks()
+        
+        # Créer le bot principal
+        intents = discord.Intents.all()
+        main_bot = commands.Bot(command_prefix="!", intents=intents)
+        main_bot.owner_id = "0"  # Bot principal
+        
+        # Configuration du bot principal
+        multi_bot.setup_commands(main_bot, "0")
+        
+        @main_bot.event
+        async def on_ready():
+            print(f"Bot principal {main_bot.user} connecté")
+            
+            # Synchroniser les commandes avec retry
+            for attempt in range(3):
+                try:
+                    synced = await main_bot.tree.sync()
+                    print(f"{len(synced)} commandes synchronisées pour le bot principal")
+                    break
+                except Exception as e:
+                    if attempt == 2:
+                        print(f"Échec sync commandes principales: {e}")
+                    else:
+                        print(f"Retry sync commandes principales: {e}")
+                        await asyncio.sleep(2)
+            
+            # Démarrer les bots utilisateur après le bot principal
+            print("Démarrage des bots utilisateur...")
+            await start_all_bots()
+        
+        @main_bot.event
+        async def on_disconnect():
+            print("Bot principal déconnecté")
+        
+        @main_bot.event
+        async def on_resumed():
+            print("Bot principal reconnecté")
+        
+        @main_bot.event
+        async def on_error(event, *args, **kwargs):
+            print(f"Erreur dans l'événement {event}: {args}")
+        
+        # Ajouter le bot principal à la collection
+        multi_bot.bots["0"] = main_bot
+        
+        # Démarrer le bot principal
+        print("Connexion du bot principal...")
+        await main_bot.start(main_token)
+        
+    except discord.LoginFailure:
+        print("Token principal invalide!")
+        raise
     except KeyboardInterrupt:
-        print("\n🛑 Bot arrêté par l'utilisateur")
-    finally:
-        import asyncio
-        asyncio.run(cleanup_on_exit())
+        print("Arrêt demandé par l'utilisateur")
+        background_tasks.stop_background_tasks()
+        raise
+    except Exception as e:
+        print(f"Erreur critique au démarrage: {e}")
+        background_tasks.stop_background_tasks()
+        raise
+
+if __name__ == "__main__":
+    print("Ce fichier doit être importé depuis main.py")

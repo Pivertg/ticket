@@ -1,5 +1,6 @@
-discord.py==2.5.1
-Flask==2.3.3
-python-dotenv==1.0.1
-psycopg2-binary==2.9.7
-asyncpg==0.30.0
+discord.py==2.3.2
+redis==5.0.1
+python-dotenv==1.0.0
+flask==3.0.0
+asyncio-mqtt==0.16.1
+audioop-lts==0.0.1  # Backport pour Python 3.13
